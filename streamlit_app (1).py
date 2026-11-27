@@ -12,6 +12,7 @@ Run locally:
 import json
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -185,33 +186,52 @@ def _normalize_from_live_status(train_no: str, fallback_name: str, live: Dict[st
     }
 
 
+def _fetch_board(stn: str) -> List[tuple]:
+    client = NTESClient(timeout=6, retries=1)
+    out = []
+    try:
+        board = client.station_live(stn, hours=2) or {}
+        entries = board.get("TrainsAtStation") or board.get("trains") or []
+        for item in entries:
+            tno = str(item.get("TrainNumber") or item.get("trainNumber") or "").strip()
+            if tno:
+                out.append((tno, str(item.get("TrainName") or item.get("trainName") or tno).strip()))
+    except Exception:
+        pass
+    return out
+
+
+def _fetch_one_train(tno: str, name: str) -> Optional[Dict[str, Any]]:
+    client = NTESClient(timeout=6, retries=1)
+    try:
+        start_date = _pick_active_start_date(client, tno)
+        live = client.live_status(tno, start_date) or {}
+        return _normalize_from_live_status(tno, name, live)
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=180, show_spinner="Fetching live NTES trains across Solapur Division...")
 def fetch_live_network_trains() -> List[Dict[str, Any]]:
     if NTESClient is None:
         return []
-    client = NTESClient(timeout=15, retries=2)
     seen: Dict[str, str] = {}
-    for stn in JUNCTIONS:
-        try:
-            board = client.station_live(stn, hours=8) or {}
-            entries = board.get("TrainsAtStation") or board.get("trains") or []
-            for item in entries:
-                tno = str(item.get("TrainNumber") or item.get("trainNumber") or "").strip()
-                if tno and tno not in seen:
-                    seen[tno] = str(item.get("TrainName") or item.get("trainName") or tno).strip()
-        except Exception:
-            continue
+    with ThreadPoolExecutor(max_workers=7) as pool:
+        for rows in pool.map(_fetch_board, JUNCTIONS):
+            for tno, name in rows:
+                if tno not in seen:
+                    seen[tno] = name
+
+    if not seen:
+        return []
 
     trains: List[Dict[str, Any]] = []
-    for tno, name in seen.items():
-        try:
-            start_date = _pick_active_start_date(client, tno)
-            live = client.live_status(tno, start_date) or {}
-            norm = _normalize_from_live_status(tno, name, live)
-            if norm:
-                trains.append(norm)
-        except Exception:
-            continue
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(_fetch_one_train, tno, name) for tno, name in seen.items()]
+        for fut in as_completed(futures):
+            res = fut.result()
+            if res:
+                trains.append(res)
     return trains
 
 
