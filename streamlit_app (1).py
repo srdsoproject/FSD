@@ -1,26 +1,26 @@
 """
-Streamlit App — Solapur Division Interactive Railway Map with Live NTES Trains.
+All-in-One Solapur Division Live Railway Map + NTES Backend.
 
-Deploy for FREE on Streamlit Community Cloud (https://share.streamlit.io) to get
-a single shareable public URL with live NTES trains—no localhost or API key needed.
+Single file—run with ONE command:
+  pip install fastapi uvicorn ntes-client
+  python app.py
 
-Run locally:
-  pip install streamlit ntes-client
-  streamlit run streamlit_app.py
+Then open: http://localhost:8000
+To share publicly for free:
+  cloudflared tunnel --url http://localhost:8000
 """
 
-import json
-import os
 import re
 import time
-import urllib.request
+import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
-import streamlit as st
-import streamlit.components.v1 as components
+import uvicorn
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 
 try:
     from ntes import NTESClient
@@ -29,23 +29,18 @@ except ImportError:
 
 IST = timezone(timedelta(hours=5, minutes=30))
 JUNCTIONS = ["WADI", "KLBG", "SUR", "KWV", "DD", "MRJ", "LUR"]
+CACHE_TTL_SEC = 180  # 3 minutes
 
-st.set_page_config(
-    page_title="Solapur Division Live Railway Map",
-    layout="wide",
-    initial_sidebar_state="collapsed",
+app = FastAPI(title="Solapur Division Live Railway Map")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET"],
+    allow_headers=["*"],
 )
 
-# Hide default Streamlit padding/chrome so the map fills the screen
-st.markdown(
-    """
-    <style>
-      .block-container { padding: 0.4rem 0.6rem 0 0.6rem; max-width: 100%; }
-      header[data-testid="stHeader"] { height: 2.2rem; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+_cache: Dict[str, Any] = {"ts": 0.0, "trains": []}
+_lock = asyncio.Lock()
 
 
 def _parse_delay_minutes(val: Any) -> int:
@@ -115,12 +110,12 @@ def _normalize_from_live_status(train_no: str, fallback_name: str, live: Dict[st
 
     stops: List[Dict[str, Any]] = []
     prev_ts = -1
-    for st_row in stns:
-        code = str(st_row.get("SC") or "").strip().upper()
+    for st in stns:
+        code = str(st.get("SC") or "").strip().upper()
         if not code:
             continue
-        arr = _parse_ntes_eta_etd_ms(st_row.get("ETA") or st_row.get("STA"), ref_year)
-        dep = _parse_ntes_eta_etd_ms(st_row.get("ETD") or st_row.get("STD"), ref_year)
+        arr = _parse_ntes_eta_etd_ms(st.get("ETA") or st.get("STA"), ref_year)
+        dep = _parse_ntes_eta_etd_ms(st.get("ETD") or st.get("STD"), ref_year)
         if arr is None and dep is None:
             continue
         if arr is None:
@@ -134,7 +129,7 @@ def _normalize_from_live_status(train_no: str, fallback_name: str, live: Dict[st
         prev_ts = dep
         stops.append({
             "code": code,
-            "name": str(st_row.get("SN") or code).strip(),
+            "name": str(st.get("SN") or code).strip(),
             "arr": arr,
             "dep": dep,
             "halt": True,
@@ -188,10 +183,9 @@ def _normalize_from_live_status(train_no: str, fallback_name: str, live: Dict[st
     }
 
 
-def _fetch_board(stn: str) -> tuple:
+def _fetch_board(stn: str) -> List[tuple]:
     client = NTESClient(timeout=10, retries=2)
     out = []
-    err = None
     try:
         board = client.station_live(stn, hours=4) or {}
         entries = board.get("TrainsAtStation") or board.get("trains") or []
@@ -200,8 +194,8 @@ def _fetch_board(stn: str) -> tuple:
             if tno:
                 out.append((tno, str(item.get("TrainName") or item.get("trainName") or tno).strip()))
     except Exception as exc:
-        err = f"{stn}: {exc}"
-    return out, err
+        print(f"[NTES station_live error] {stn}: {exc}")
+    return out
 
 
 def _fetch_one_train(tno: str, name: str) -> Optional[Dict[str, Any]]:
@@ -210,90 +204,4019 @@ def _fetch_one_train(tno: str, name: str) -> Optional[Dict[str, Any]]:
         start_date = _pick_active_start_date(client, tno)
         live = client.live_status(tno, start_date) or {}
         return _normalize_from_live_status(tno, name, live)
-    except Exception:
+    except Exception as exc:
+        print(f"[NTES live_status error] {tno}: {exc}")
         return None
 
 
-DEFAULT_FEED_URL = "https://hollow-secretary-partner-trinity.trycloudflare.com/api/live-network"
-
-
-def _get_remote_feed_url() -> str:
-    try:
-        if "LIVE_NETWORK_URL" in st.secrets:
-            val = str(st.secrets["LIVE_NETWORK_URL"]).strip()
-            if val:
-                return val
-    except Exception:
-        pass
-    return os.environ.get("LIVE_NETWORK_URL", "").strip() or DEFAULT_FEED_URL
-
-
-@st.cache_data(ttl=180, show_spinner="Fetching live NTES trains across Solapur Division...")
-def fetch_live_network_trains() -> Dict[str, Any]:
-    remote_url = _get_remote_feed_url()
-    if remote_url:
-        try:
-            req = urllib.request.Request(remote_url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            trains = data if isinstance(data, list) else (data.get("trains") or [])
-            return {"trains": trains, "board_count": len(trains), "errors": []}
-        except Exception as exc:
-            return {"trains": [], "board_count": 0, "errors": [f"Feed URL error: {exc}"]}
-
+def _fetch_all_junction_trains_sync() -> List[Dict[str, Any]]:
     if NTESClient is None:
-        return {"trains": [], "board_count": 0, "errors": ["ntes-client not installed"]}
+        raise RuntimeError("ntes-client is not installed. Run: pip install ntes-client")
+
     seen: Dict[str, str] = {}
-    errors: List[str] = []
     with ThreadPoolExecutor(max_workers=3) as pool:
-        for rows, err in pool.map(_fetch_board, JUNCTIONS):
-            if err:
-                errors.append(err)
+        for rows in pool.map(_fetch_board, JUNCTIONS):
             for tno, name in rows:
                 if tno not in seen:
                     seen[tno] = name
 
     if not seen:
-        return {"trains": [], "board_count": 0, "errors": errors}
+        return []
 
     trains: List[Dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=3) as pool:
+    with ThreadPoolExecutor(max_workers=4) as pool:
         futures = [pool.submit(_fetch_one_train, tno, name) for tno, name in seen.items()]
         for fut in as_completed(futures):
             res = fut.result()
             if res:
                 trains.append(res)
-    return {"trains": trains, "board_count": len(seen), "errors": errors}
+    return trains
 
 
-col1, col2 = st.columns([5, 1])
-with col2:
-    if st.button("Refresh Live Trains", use_container_width=True):
-        fetch_live_network_trains.clear()
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return HTMLResponse(content=MAP_HTML)
 
-if NTESClient is None:
-    st.error("`ntes-client` is not installed in this Python environment. Run: `pip install ntes-client`")
 
-res_data = fetch_live_network_trains()
-trains = res_data["trains"]
-with col1:
-    err_note = f" · Errors: {'; '.join(res_data['errors'][:2])}" if res_data["errors"] else ""
-    st.caption(
-        f"Live NTES Feed · {len(trains)}/{res_data['board_count']} trains loaded across {', '.join(JUNCTIONS)} · "
-        f"Updated {datetime.now(IST).strftime('%H:%M:%S IST')}{err_note}"
-    )
+@app.get("/health")
+async def health():
+    return {
+        "ok": True,
+        "ntesLoaded": NTESClient is not None,
+        "cachedTrains": len(_cache["trains"]),
+        "cacheAgeSec": round(time.time() - _cache["ts"], 1),
+    }
 
-html_path = Path(__file__).parent / "railway_network_map.html"
-if not html_path.exists():
-    st.error("Place `railway_network_map.html` in the same folder as `streamlit_app.py`.")
-else:
-    html_text = html_path.read_text(encoding="utf-8")
-    # Inject live trains into <head> before the map script initializes
-    inject_script = f"""
-    <script>
-      window.__PRELOADED_LIVE_TRAINS__ = {json.dumps(trains)};
-    </script>
-    </head>
-    """
-    html_text = html_text.replace("</head>", inject_script, 1)
-    components.html(html_text, height=820, scrolling=False)
+
+@app.get("/api/live-network")
+async def live_network():
+    now = time.time()
+    if now - _cache["ts"] < CACHE_TTL_SEC and _cache["trains"]:
+        return {"trains": _cache["trains"], "cached": True, "updatedAt": int(_cache["ts"] * 1000)}
+
+    async with _lock:
+        if time.time() - _cache["ts"] < CACHE_TTL_SEC and _cache["trains"]:
+            return {"trains": _cache["trains"], "cached": True, "updatedAt": int(_cache["ts"] * 1000)}
+        trains = await asyncio.to_thread(_fetch_all_junction_trains_sync)
+        _cache["ts"] = time.time()
+        _cache["trains"] = trains
+        return {"trains": trains, "cached": False, "updatedAt": int(_cache["ts"] * 1000)}
+
+
+MAP_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <title>Interactive Railway Network Map — Real Track Geometry, Free Route Selection &amp; Live GPS</title>
+  <script src="https://cdn.tailwindcss.com/3.4.17"></script>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <style>
+    html, body {
+      margin: 0; padding: 0; height: 100%; width: 100%;
+      font-family: 'Inter', system-ui, -apple-system, sans-serif;
+      overflow: hidden; background: #0f172a;
+    }
+    #map {
+      width: 100%;
+      height: calc(100vh - 64px);
+      min-height: 540px;
+      z-index: 1;
+    }
+    .station-label-tooltip {
+      background: rgba(15, 23, 42, 0.92);
+      border: 1px solid rgba(255, 255, 255, 0.28);
+      color: #f8fafc;
+      font-size: 10px;
+      font-weight: 700;
+      padding: 1px 5px;
+      border-radius: 4px;
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35);
+      letter-spacing: 0.03em;
+    }
+    .station-label-tooltip::before { display: none; }
+    .lc-marker-icon {
+      display: flex; align-items: center; justify-content: center;
+      width: 18px; height: 18px;
+      background: #fef08a; border: 2px solid #b91c1c;
+      border-radius: 4px; transform: rotate(45deg);
+      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.45);
+    }
+    .lc-marker-icon span {
+      transform: rotate(-45deg); font-size: 8px; font-weight: 800; color: #991b1b; line-height: 1;
+    }
+    .bridge-marker-icon {
+      display: flex; align-items: center; justify-content: center;
+      width: 20px; height: 20px;
+      background: #0284c7; border: 2px solid #ffffff;
+      border-radius: 5px; color: #ffffff; font-size: 10px; font-weight: 800;
+      box-shadow: 0 2px 6px rgba(2, 132, 199, 0.55);
+    }
+    .boundary-marker-icon {
+      display: flex; align-items: center; justify-content: center;
+      width: 22px; height: 22px;
+      background: #dc2626; border: 2px solid #ffffff;
+      border-radius: 50%; color: #ffffff; font-size: 10px; font-weight: 800;
+      box-shadow: 0 2px 8px rgba(220, 38, 38, 0.6);
+    }
+    /* Live Official GPS Beacon */
+    .live-gps-wrapper {
+      position: relative;
+      width: 36px;
+      height: 36px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .live-gps-pulse {
+      position: absolute;
+      width: 34px;
+      height: 34px;
+      border-radius: 9999px;
+      background: rgba(16, 185, 129, 0.35);
+      border: 2px solid rgba(16, 185, 129, 0.7);
+      animation: gpsPulseRing 1.8s cubic-bezier(0, 0, 0.2, 1) infinite;
+    }
+    .live-gps-core {
+      position: relative;
+      width: 16px;
+      height: 16px;
+      border-radius: 9999px;
+      background: #10b981;
+      border: 3px solid #ffffff;
+      box-shadow: 0 0 12px rgba(16, 185, 129, 0.95);
+      z-index: 2;
+    }
+    @keyframes gpsPulseRing {
+      0% { transform: scale(0.55); opacity: 0.95; }
+      80%, 100% { transform: scale(1.55); opacity: 0; }
+    }
+    .snapped-track-dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 9999px;
+      background: #f59e0b;
+      border: 2px solid #ffffff;
+      box-shadow: 0 0 8px rgba(245, 158, 11, 0.9);
+    }
+    .endpoint-pin-badge {
+      display: flex; align-items: center; justify-content: center;
+      padding: 2px 6px; border-radius: 9999px;
+      font-size: 10px; font-weight: 800; color: #ffffff;
+      border: 2px solid #ffffff;
+      box-shadow: 0 3px 10px rgba(0,0,0,0.5);
+      white-space: nowrap;
+    }
+    .leaflet-popup-content-wrapper {
+      border-radius: 12px;
+      box-shadow: 0 10px 25px rgba(15, 23, 42, 0.25);
+      padding: 2px;
+    }
+    .leaflet-popup-content { margin: 12px 14px; font-family: 'Inter', system-ui, sans-serif; }
+    .pin-cursor #map { cursor: crosshair !important; }
+    @media (max-width: 768px) {
+      #map { height: calc(100vh - 108px); min-height: 440px; }
+    }
+  
+    /* ===== Live Trains ===== */
+    .lt-icon { background: transparent !important; border: 0 !important; }
+    .lt-pin { position: relative; width: 24px; height: 24px; }
+    .lt-dot {
+      width: 24px; height: 24px; border-radius: 9999px; box-sizing: border-box;
+      background: var(--c, #10b981); border: 2.5px solid #fff;
+      display: flex; align-items: center; justify-content: center;
+      box-shadow: 0 2px 8px rgba(0,0,0,.55);
+    }
+    .lt-sim .lt-dot { border-style: dashed; }
+    .lt-sel .lt-dot { box-shadow: 0 0 0 4px rgba(56,189,248,.55), 0 2px 8px rgba(0,0,0,.55); }
+    .lt-stop { width: 8px; height: 8px; border-radius: 2px; background: #fff; }
+    .lt-label {
+      position: absolute; left: 28px; top: 2px; white-space: nowrap;
+      background: rgba(15,23,42,.92); color: #f8fafc; border: 1px solid rgba(255,255,255,.28);
+      font: 700 10px/1 'Inter', system-ui, sans-serif; padding: 3px 5px; border-radius: 5px;
+      box-shadow: 0 2px 6px rgba(0,0,0,.4); letter-spacing: .02em;
+    }
+    .lt-label b { color: var(--c, #10b981); margin-left: 4px; font-weight: 800; }
+    .lt-lowzoom .lt-label { display: none; }
+    .lt-row { cursor: pointer; }
+    .lt-row:hover { background: rgba(51,65,85,.55); }
+  </style>
+</head>
+<body class="bg-slate-900 text-slate-100 flex flex-col h-screen">
+
+  <header class="bg-slate-900/95 border-b border-slate-700/80 px-3 sm:px-5 py-2.5 flex flex-wrap items-center justify-between gap-2 z-20 shrink-0">
+    <div class="flex items-center gap-3">
+      <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-emerald-500 via-blue-500 to-purple-600 flex items-center justify-center shadow-md shrink-0">
+        <svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" stroke-width="2.2" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7" />
+        </svg>
+      </div>
+      <div>
+        <div class="flex items-center gap-2">
+          <h1 class="text-sm sm:text-base font-bold text-white leading-tight">Railway Network Interactive Map</h1>
+          <span id="headerTrackBadge" class="hidden md:inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+            <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span> Free Route &amp; Live GPS
+          </span>
+        </div>
+        <p class="text-[11px] text-slate-400 leading-tight" id="statsSummary">87 Stations · 30 LC Gates · 11 Bridges · 7 Boundaries · Source-to-Destination Route</p>
+      </div>
+    </div>
+
+    <div class="flex items-center gap-2 flex-wrap">
+      <div class="relative">
+        <input
+          id="searchInput"
+          type="text"
+          placeholder="Search station, LC, bridge, boundary..."
+          autocomplete="off"
+          class="w-44 sm:w-60 bg-slate-800 border border-slate-700 text-xs text-white placeholder-slate-400 rounded-lg pl-8 pr-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-blue-500"
+        />
+        <svg class="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-2" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M21 21l-4.35-4.35M11 19a8 8 0 100-16 8 8 0 000 16z" />
+        </svg>
+        <div id="searchResults" class="hidden absolute left-0 right-0 mt-1 bg-slate-800 border border-slate-700 rounded-lg shadow-xl max-h-56 overflow-y-auto z-50"></div>
+      </div>
+
+      <button id="liveGpsHeaderBtn" type="button" class="bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold px-3 py-1.5 rounded-lg transition cursor-pointer flex items-center gap-1.5 shadow-sm">
+        <span id="headerGpsDot" class="w-2 h-2 rounded-full bg-white"></span>
+        <span id="headerGpsLabel">Use My Location</span>
+      </button>
+
+      <button id="locateMeBtn" type="button" title="Center on current live position" class="bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-100 text-xs font-medium px-2.5 py-1.5 rounded-lg transition cursor-pointer flex items-center gap-1">
+        <svg class="w-3.5 h-3.5 text-emerald-400" fill="none" stroke="currentColor" stroke-width="2.2" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M12 2v2m0 16v2m10-10h-2M4 12H2m15.364-5.364l-1.414 1.414M8.05 15.95l-1.414 1.414m0-11.314l1.414 1.414m7.9 7.9l1.414 1.414M12 8a4 4 0 100 8 4 4 0 000-8z" />
+        </svg>
+        <span class="hidden sm:inline">My Position</span>
+      </button>
+
+      <select id="basemapSelect" class="bg-slate-800 border border-slate-700 text-xs text-slate-100 rounded-lg px-2.5 py-1.5 focus:outline-none focus:ring-2 focus:ring-blue-500">
+        <option value="satellite" selected>Satellite</option>
+        <option value="topo">Topographic</option>
+        <option value="dark">Dark Canvas</option>
+      </select>
+
+      <button id="liveTrainsBtn" type="button" class="bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold px-3 py-1.5 rounded-lg transition cursor-pointer flex items-center gap-1.5 shadow-sm">
+        <span class="w-2 h-2 rounded-full bg-emerald-300 animate-pulse"></span>
+        Live Trains
+        <span id="ltCount" class="bg-white/20 rounded-full px-1.5 text-[10px] font-bold">0</span>
+      </button>
+
+      <button id="resetViewBtn" type="button" class="bg-blue-600 hover:bg-blue-500 text-white text-xs font-medium px-3 py-1.5 rounded-lg transition cursor-pointer">
+        Fit Network
+      </button>
+    </div>
+  </header>
+
+  <div class="relative flex-1 w-full">
+    <div id="map"></div>
+
+    <!-- Real Railway Track Status Pill -->
+    <div id="trackStatusPill" class="absolute top-3 left-14 z-[1000] bg-slate-900/95 backdrop-blur-md border border-slate-700/80 text-slate-100 text-[11px] px-3 py-1.5 rounded-full shadow-lg flex items-center gap-2">
+      <span id="trackStatusDot" class="w-2.5 h-2.5 rounded-full bg-amber-400 animate-pulse"></span>
+      <span id="trackStatusText">Connecting real railway track geometry...</span>
+      <button id="retryTrackBtn" type="button" class="hidden text-blue-400 hover:text-blue-300 font-semibold underline cursor-pointer ml-1">Sync OSM</button>
+    </div>
+
+    <!-- Official Route & Live GPS Tracker (Horizontal Bottom Dock) -->
+    <div id="liveLocationPanel" class="absolute bottom-2.5 left-1/2 -translate-x-1/2 z-[1000] bg-slate-900/95 backdrop-blur-md border border-slate-700/90 rounded-xl shadow-2xl px-3 py-2 w-[calc(100vw-20px)] max-w-[1220px] text-xs transition-all">
+      <!-- Compact Horizontal Header Strip -->
+      <div class="flex flex-wrap items-center justify-between gap-2 pb-1.5 border-b border-slate-700/80">
+        <div class="flex items-center gap-2 min-w-0">
+          <span id="liveHudDot" class="w-2.5 h-2.5 rounded-full bg-emerald-400 shrink-0"></span>
+          <span class="font-bold text-white text-xs whitespace-nowrap">Official Route &amp; Live GPS Tracker</span>
+          <span class="text-slate-600 hidden sm:inline">|</span>
+          <span id="liveStatusSubtext" class="text-[10px] text-slate-400 truncate hidden sm:inline">Select Source &amp; Destination or Start GPS</span>
+        </div>
+
+        <div class="flex items-center gap-2 flex-wrap">
+          <div id="selectedRouteSummary" class="bg-slate-800/90 border border-slate-700 rounded-lg px-2 py-0.5 text-[10px] flex items-center gap-2">
+            <span id="routeStationsCountText" class="text-slate-200 font-semibold">SUR → KWV (11 Stns)</span>
+            <span id="routeDistanceText" class="text-emerald-400 font-bold font-mono">~78.7 km</span>
+          </div>
+          <label class="flex items-center gap-1 cursor-pointer text-[10px] text-slate-300" title="Automatically pauses when you drag the map to explore">
+            <input type="checkbox" id="followGpsToggle" checked class="accent-emerald-500 rounded" />
+            <span>Auto-Follow</span>
+          </label>
+          <label class="flex items-center gap-1 cursor-pointer text-[10px] text-slate-300">
+            <input type="checkbox" id="recordTrailToggle" checked class="accent-blue-500 rounded" />
+            <span>Trail</span>
+          </label>
+          <label class="flex items-center gap-1 cursor-pointer text-[10px] text-emerald-300" title="Voice callout for upcoming signal at 1km and 500m">
+            <input type="checkbox" id="ttsToggle" checked class="accent-emerald-500 rounded" />
+            <span>Voice</span>
+          </label>
+          <label class="flex items-center gap-1 cursor-pointer text-[10px] text-amber-300" title="Automatically apply physics-based braking to stop smoothly at destination">
+            <input type="checkbox" id="autoBrakeToggle" checked class="accent-amber-500 rounded" />
+            <span>Auto-Brake</span>
+          </label>
+          <label class="flex items-center gap-1 cursor-pointer text-[10px] text-slate-300">
+            <input type="checkbox" id="isolateRouteToggle" class="accent-indigo-500 rounded" />
+            <span class="hidden sm:inline">Route Only</span>
+          </label>
+          <button id="copyInspectionReportBtn" type="button" class="text-[10px] text-emerald-400 hover:text-emerald-300 font-semibold underline cursor-pointer">Copy Report</button>
+          <span id="gpsModeBadge" class="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-slate-800 text-emerald-300 border border-emerald-500/30">Ready</span>
+          <button id="toggleLivePanelBtn" type="button" class="text-slate-400 hover:text-white text-[11px] font-medium px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 cursor-pointer">Min</button>
+        </div>
+      </div>
+
+      <!-- Horizontal 3-Column Body -->
+      <div id="livePanelBody" class="pt-2 grid grid-cols-1 lg:grid-cols-12 gap-2.5 items-stretch max-h-[38vh] lg:max-h-none overflow-y-auto">
+
+        <!-- Section 1: Route Selection & Action Buttons (5 cols) -->
+        <div class="lg:col-span-5 bg-slate-800/80 border border-blue-500/30 rounded-lg p-2 flex flex-col justify-between gap-1.5">
+          <div class="grid grid-cols-11 gap-1 items-center">
+            <div class="col-span-5">
+              <label class="text-[9px] uppercase text-slate-400 block mb-0.5">From (Source)</label>
+              <select id="fromStationSelect" class="w-full bg-slate-900 border border-slate-700 text-[11px] font-semibold text-emerald-300 rounded-md px-1.5 py-1 focus:outline-none focus:ring-1 focus:ring-emerald-500"></select>
+            </div>
+            <div class="col-span-1 flex items-end justify-center pt-3">
+              <button id="swapRouteBtn" type="button" title="Swap Source & Destination" class="bg-slate-700 hover:bg-slate-600 text-slate-200 rounded-md px-1.5 py-1 transition cursor-pointer">⇄</button>
+            </div>
+            <div class="col-span-5">
+              <label class="text-[9px] uppercase text-slate-400 block mb-0.5">To (Destination)</label>
+              <select id="toStationSelect" class="w-full bg-slate-900 border border-slate-700 text-[11px] font-semibold text-amber-300 rounded-md px-1.5 py-1 focus:outline-none focus:ring-1 focus:ring-amber-500"></select>
+            </div>
+          </div>
+
+          <div class="flex items-center gap-1.5">
+            <select id="simCorridorSelect" title="Quick Section Preset" class="flex-1 min-w-0 bg-slate-900 border border-slate-700 text-[10px] text-slate-300 rounded-md px-1.5 py-1">
+              <option value="custom">-- Custom Route --</option>
+              <option value="c1">Preset: WADI → SUR</option>
+              <option value="c3" selected>Preset: SUR → KWV</option>
+              <option value="c4">Preset: KWV → DD</option>
+              <option value="c5">Preset: MRJ → KWV</option>
+              <option value="c6">Preset: KWV → LUR</option>
+              <option value="c2">Preset: KLBG → TJSP</option>
+            </select>
+            <div class="flex items-center bg-slate-900 border border-slate-700 rounded-md p-0.5 shrink-0" title="Cab Reverser (Forward / Neutral / Reverse)">
+              <button id="revFBtn" type="button" class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-emerald-600 text-white cursor-pointer transition">F</button>
+              <button id="revNBtn" type="button" class="px-1.5 py-0.5 rounded text-[10px] font-bold text-slate-400 hover:text-white cursor-pointer transition">N</button>
+              <button id="revRBtn" type="button" class="px-1.5 py-0.5 rounded text-[10px] font-bold text-slate-400 hover:text-white cursor-pointer transition">R</button>
+            </div>
+            <select id="simMultiplierSelect" title="Simulation Time Speed (Real-Time Multiplier)" class="w-14 shrink-0 bg-slate-900 border border-slate-700 text-[10px] font-bold text-sky-300 rounded-md px-1 py-1">
+              <option value="0.5">0.50x</option>
+              <option value="0.75">0.75x</option>
+              <option value="1" selected>1x</option>
+              <option value="1.5">1.50x</option>
+              <option value="2">2x</option>
+            </select>
+            <button id="fitSelectedRouteBtn" type="button" class="shrink-0 bg-slate-700 hover:bg-slate-600 text-slate-100 font-medium py-1 px-2 rounded-md text-[10px] transition cursor-pointer">Focus</button>
+            <button id="clearCustomRouteBtn" type="button" class="shrink-0 bg-slate-700 hover:bg-slate-600 text-slate-200 font-medium py-1 px-2 rounded-md text-[10px] transition cursor-pointer">All</button>
+          </div>
+
+          <!-- Driver Cab 8-Notch Master Controller -->
+          <div class="flex items-center justify-between gap-1 bg-slate-900/90 border border-slate-700/80 rounded-md px-1.5 py-1">
+            <span class="text-[9px] uppercase tracking-wider text-slate-400 font-semibold shrink-0">Notch</span>
+            <div id="notchStrip" class="flex items-center gap-0.5 flex-1 justify-center">
+              <button type="button" data-notch="0" class="notch-btn px-1.5 py-0.5 rounded text-[9px] font-bold bg-slate-700 text-slate-200 cursor-pointer" title="Idle (0 km/h)">0</button>
+              <button type="button" data-notch="1" class="notch-btn px-1.5 py-0.5 rounded text-[9px] font-bold bg-slate-800 text-slate-400 hover:text-white cursor-pointer" title="Notch 1 (20 km/h)">1</button>
+              <button type="button" data-notch="2" class="notch-btn px-1.5 py-0.5 rounded text-[9px] font-bold bg-slate-800 text-slate-400 hover:text-white cursor-pointer" title="Notch 2 (40 km/h)">2</button>
+              <button type="button" data-notch="3" class="notch-btn px-1.5 py-0.5 rounded text-[9px] font-bold bg-slate-800 text-slate-400 hover:text-white cursor-pointer" title="Notch 3 (65 km/h)">3</button>
+              <button type="button" data-notch="4" class="notch-btn px-1.5 py-0.5 rounded text-[9px] font-bold bg-emerald-600 text-white cursor-pointer" title="Notch 4 (90 km/h)">4</button>
+              <button type="button" data-notch="5" class="notch-btn px-1.5 py-0.5 rounded text-[9px] font-bold bg-slate-800 text-slate-400 hover:text-white cursor-pointer" title="Notch 5 (115 km/h)">5</button>
+              <button type="button" data-notch="6" class="notch-btn px-1.5 py-0.5 rounded text-[9px] font-bold bg-slate-800 text-slate-400 hover:text-white cursor-pointer" title="Notch 6 (140 km/h)">6</button>
+              <button type="button" data-notch="7" class="notch-btn px-1.5 py-0.5 rounded text-[9px] font-bold bg-slate-800 text-slate-400 hover:text-white cursor-pointer" title="Notch 7 (160 km/h)">7</button>
+              <button type="button" data-notch="8" class="notch-btn px-1.5 py-0.5 rounded text-[9px] font-bold bg-slate-800 text-slate-400 hover:text-white cursor-pointer" title="Notch 8 (180 km/h)">8</button>
+            </div>
+            <span id="cabNotchReadout" class="text-[10px] font-mono font-bold text-emerald-300 shrink-0">F·N4 · 90</span>
+            <button id="cabBrakeBtn" type="button" title="Apply / Release Service Brake" class="px-1.5 py-0.5 rounded text-[9px] font-bold bg-slate-800 border border-rose-500/40 text-rose-300 hover:bg-rose-600/30 cursor-pointer shrink-0 transition">BRK</button>
+          </div>
+
+          <div class="grid grid-cols-4 gap-1.5">
+            <button id="simToggleBtn" type="button" class="bg-indigo-600 hover:bg-indigo-500 text-white font-semibold py-1 px-1.5 rounded-md text-[10px] transition cursor-pointer shadow">Run Route Sim</button>
+            <button id="startGpsBtn" type="button" class="bg-emerald-600 hover:bg-emerald-500 text-white font-semibold py-1 px-1.5 rounded-md text-[10px] transition cursor-pointer flex items-center justify-center gap-1 shadow">
+              <span id="startGpsBtnText">In Train GPS</span>
+            </button>
+            <button id="pinInspectBtn" type="button" class="bg-amber-600/90 hover:bg-amber-500 text-white font-semibold py-1 px-1.5 rounded-md text-[10px] transition cursor-pointer">
+              <span id="pinInspectBtnText">Tap Route</span>
+            </button>
+            <button id="stopTrackingBtn" type="button" class="bg-slate-900 hover:bg-slate-700 border border-slate-600 text-slate-200 font-medium py-1 px-1.5 rounded-md text-[10px] transition cursor-pointer">Stop / Clear</button>
+          </div>
+        </div>
+
+        <!-- Section 2: Live Chainage & Telemetry (3 cols) -->
+        <div class="lg:col-span-3 bg-slate-800/80 border border-slate-700 rounded-lg p-2 flex flex-col justify-between gap-1.5">
+          <div class="flex items-center justify-between">
+            <div>
+              <span class="text-[9px] uppercase tracking-wider text-slate-400 block">Live Chainage</span>
+              <div class="flex items-baseline gap-1">
+                <span id="liveKmValue" class="text-sm font-extrabold text-emerald-400 font-mono">Km 454.97</span>
+                <span id="liveCorridorBadge" class="text-[9px] font-bold px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-300 border border-blue-500/30">SUR→KWV</span>
+              </div>
+            </div>
+            <div class="text-right">
+              <span class="text-[9px] uppercase tracking-wider text-slate-400 block">Track Snap</span>
+              <span id="liveTrackOffset" class="text-[10px] font-bold text-emerald-300">On Track (0 m)</span>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-3 gap-1 text-center">
+            <div class="bg-slate-900/75 rounded p-1">
+              <div class="text-[8px] uppercase text-slate-400">Speed</div>
+              <div id="liveSpeedValue" class="text-[11px] font-bold text-white font-mono">0.0 km/h</div>
+            </div>
+            <div class="bg-slate-900/75 rounded p-1">
+              <div class="text-[8px] uppercase text-slate-400">To Dest</div>
+              <div id="liveRemainDistValue" class="text-[11px] font-bold text-amber-300 font-mono">78.7 km</div>
+            </div>
+            <div class="bg-slate-900/75 rounded p-1">
+              <div class="text-[8px] uppercase text-slate-400">Acc / Line</div>
+              <div class="text-[10px] font-bold text-slate-200 font-mono"><span id="liveAccuracyValue">±4 m</span> · <span id="liveLineTypeValue" class="text-sky-300">Double</span></div>
+            </div>
+          </div>
+
+          <div class="flex items-center justify-between gap-2 bg-slate-900/75 px-2 py-1 rounded border border-slate-700/60">
+            <div id="liveBlockSection" class="text-[10px] font-semibold text-slate-100 truncate">At SUR Junction (Solapur)</div>
+            <span id="simStatusLabel" class="text-[9px] text-slate-400 shrink-0">Idle</span>
+          </div>
+        </div>
+
+        <!-- Section 3: Next Assets Ahead Along Route (4 cols) -->
+        <div class="lg:col-span-4 bg-slate-800/80 border border-slate-700 rounded-lg p-2 flex flex-col justify-between gap-1">
+          <div class="flex items-center justify-between bg-emerald-950/60 border border-emerald-500/40 px-2 py-1 rounded-md">
+            <div class="min-w-0 pr-2">
+              <span class="text-[9px] uppercase text-emerald-300 font-bold mr-1.5">Next Signal:</span>
+              <span id="nextSignalText" class="text-[11px] font-bold text-emerald-200 truncate">—</span>
+            </div>
+            <button id="jumpNextSignalBtn" type="button" class="text-[10px] bg-emerald-600/30 hover:bg-emerald-600/50 text-emerald-300 border border-emerald-500/40 px-2 py-0.5 rounded font-semibold shrink-0 cursor-pointer">View</button>
+          </div>
+
+          <div class="flex items-center justify-between bg-slate-900/75 px-2 py-1 rounded-md">
+            <div class="min-w-0 pr-2">
+              <span class="text-[9px] uppercase text-slate-400 mr-1.5">Next Station:</span>
+              <span id="nextStationText" class="text-[11px] font-bold text-white truncate">BALE · Km 448.7 (6.27 km)</span>
+            </div>
+            <button id="jumpNextStationBtn" type="button" class="text-[10px] bg-blue-600/30 hover:bg-blue-600/50 text-blue-300 border border-blue-500/30 px-2 py-0.5 rounded font-semibold shrink-0 cursor-pointer">View</button>
+          </div>
+
+          <div class="flex items-center justify-between bg-slate-900/75 px-2 py-1 rounded-md">
+            <div class="min-w-0 pr-2">
+              <span class="text-[9px] uppercase text-slate-400 mr-1.5">Next LC Gate:</span>
+              <span id="nextLcText" class="text-[11px] font-bold text-amber-300 truncate">LC-42 (MA) · 55.2 km</span>
+            </div>
+            <button id="jumpNextLcBtn" type="button" class="text-[10px] bg-amber-500/20 hover:bg-amber-500/40 text-amber-300 border border-amber-500/30 px-2 py-0.5 rounded font-semibold shrink-0 cursor-pointer">View</button>
+          </div>
+
+          <div class="flex items-center justify-between bg-slate-900/75 px-2 py-1 rounded-md">
+            <div class="min-w-0 pr-2">
+              <span class="text-[9px] uppercase text-slate-400 mr-1.5">Next Bridge:</span>
+              <span id="nextBridgeText" class="text-[11px] font-bold text-sky-300 truncate">Seena Bridge · Km 431.1 (19.9 km)</span>
+            </div>
+            <button id="jumpNextBridgeBtn" type="button" class="text-[10px] bg-sky-500/20 hover:bg-sky-500/40 text-sky-300 border border-sky-500/30 px-2 py-0.5 rounded font-semibold shrink-0 cursor-pointer">View</button>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- Map Layers Control Panel (Right Floating Panel) -->
+    <div id="controlPanel" class="absolute top-3 right-3 z-[1000] bg-slate-900/92 backdrop-blur-md border border-slate-700/80 rounded-xl shadow-2xl p-3 w-64 max-w-[calc(100vw-24px)] text-xs">
+      <div class="flex items-center justify-between mb-2">
+        <span class="font-semibold text-slate-200 uppercase tracking-wider text-[10px]">Map Layers</span>
+        <button id="togglePanelBtn" type="button" class="text-slate-400 hover:text-white text-[11px] font-medium cursor-pointer">Hide</button>
+      </div>
+
+      <div id="panelBody" class="space-y-2.5">
+        <div class="grid grid-cols-2 gap-1.5">
+          <label class="flex items-center gap-1.5 bg-slate-800/80 px-2 py-1.5 rounded-lg cursor-pointer hover:bg-slate-800">
+            <input type="checkbox" id="toggleStations" checked class="accent-blue-500 rounded" />
+            <span class="text-slate-200">Stations (87)</span>
+          </label>
+          <label class="flex items-center gap-1.5 bg-slate-800/80 px-2 py-1.5 rounded-lg cursor-pointer hover:bg-slate-800">
+            <input type="checkbox" id="toggleLabels" class="accent-blue-500 rounded" />
+            <span class="text-slate-200">Labels</span>
+          </label>
+          <label class="flex items-center gap-1.5 bg-slate-800/80 px-2 py-1.5 rounded-lg cursor-pointer hover:bg-slate-800">
+            <input type="checkbox" id="toggleLCs" checked class="accent-amber-500 rounded" />
+            <span class="text-slate-200">LC Gates (30)</span>
+          </label>
+          <label class="flex items-center gap-1.5 bg-slate-800/80 px-2 py-1.5 rounded-lg cursor-pointer hover:bg-slate-800">
+            <input type="checkbox" id="toggleBridges" checked class="accent-sky-500 rounded" />
+            <span class="text-slate-200">Bridges (11)</span>
+          </label>
+          <label class="flex items-center gap-1.5 bg-slate-800/80 px-2 py-1.5 rounded-lg cursor-pointer hover:bg-slate-800">
+            <input type="checkbox" id="toggleSignals" checked class="accent-green-500 rounded" />
+            <span class="text-slate-200">Signals (687)</span>
+          </label>
+          <label class="flex items-center gap-1.5 bg-slate-800/80 px-2 py-1.5 rounded-lg cursor-pointer hover:bg-slate-800">
+            <input type="checkbox" id="toggleBoundaries" checked class="accent-red-500 rounded" />
+            <span class="text-slate-200">Boundaries (7)</span>
+          </label>
+          <label class="flex items-center gap-1.5 bg-slate-800/80 px-2 py-1.5 rounded-lg cursor-pointer hover:bg-slate-800 col-span-2">
+            <input type="checkbox" id="toggleRailAtlas" class="accent-emerald-500 rounded" />
+            <span class="text-slate-200">OpenRailwayMap Overlay</span>
+          </label>
+        </div>
+
+        <div class="pt-1 border-t border-slate-700/70">
+          <div class="flex items-center justify-between mb-1.5">
+            <span class="font-semibold text-slate-300 text-[10px] uppercase tracking-wider">Sections</span>
+            <button id="showAllLinesBtn" type="button" class="text-[10px] text-blue-400 hover:text-blue-300 cursor-pointer">Show All</button>
+          </div>
+          <div id="lineFilters" class="grid grid-cols-2 gap-1.5"></div>
+        </div>
+
+        <div class="pt-1.5 border-t border-slate-700/70 flex flex-wrap items-center justify-between gap-1 text-[10px] text-slate-300">
+          <span class="flex items-center gap-1">
+            <span class="inline-block w-2.5 h-2.5 rounded-full border-2 border-white bg-blue-500"></span> Hub
+          </span>
+          <span class="flex items-center gap-1">
+            <span class="inline-block w-2.5 h-2.5 bg-yellow-300 border border-red-700 rotate-45"></span> LC
+          </span>
+          <span class="flex items-center gap-1">
+            <span class="inline-block w-3 h-3 rounded bg-sky-600 border border-white text-[8px] text-center leading-3 font-bold">B</span> Bridge
+          </span>
+          <span class="flex items-center gap-1">
+            <span class="inline-block w-3 h-3 rounded-full bg-red-600 border border-white"></span> Boundary
+          </span>
+          <span class="flex items-center gap-1">
+            <span class="inline-block w-2.5 h-2.5 rounded-full bg-green-500 border border-white"></span> Signal
+          </span>
+          <span class="flex items-center gap-1">
+            <span class="inline-block w-3 h-3 rounded-full bg-emerald-500 border-2 border-white"></span> Live GPS
+          </span>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- Live Trains Panel -->
+    <div id="liveTrainsPanel" class="hidden absolute top-14 left-14 z-[1000] w-[22rem] max-w-[calc(100vw-72px)] max-h-[calc(100vh-200px)] flex flex-col bg-slate-900/95 backdrop-blur-md border border-slate-700/80 rounded-xl shadow-2xl text-xs text-slate-100">
+      <div class="flex items-center justify-between px-3 py-2 border-b border-slate-700/80 shrink-0">
+        <div class="flex items-center gap-2 min-w-0">
+          <span class="font-bold text-white text-xs">Live Trains</span>
+          <span id="ltStatus" class="text-[10px] text-slate-400 truncate">—</span>
+        </div>
+        <div class="flex items-center gap-1.5">
+          <button id="ltRefresh" type="button" class="text-[10px] bg-slate-800 hover:bg-slate-700 border border-slate-700 px-2 py-0.5 rounded cursor-pointer">Refresh</button>
+          <button id="ltClose" type="button" class="text-slate-400 hover:text-white px-1 cursor-pointer" title="Close">✕</button>
+        </div>
+      </div>
+
+      <div class="p-2.5 space-y-2 overflow-y-auto">
+        <div class="flex items-center gap-2">
+          <label class="text-[9px] uppercase text-slate-400 shrink-0">Source</label>
+          <select id="ltProvider" class="flex-1 bg-slate-800 border border-slate-700 text-[11px] rounded-md px-1.5 py-1">
+            <option value="network">Live Network (All Running Trains)</option>
+            <option value="demo">Demo (simulated trains)</option>
+            <option value="live">Single-Train API (RailRadar / RapidAPI)</option>
+          </select>
+        </div>
+
+        <div id="ltNetworkBox" class="hidden space-y-1.5">
+          <details id="ltNetworkSettings" class="bg-slate-800/70 border border-slate-700 rounded-lg px-2 py-1.5">
+            <summary class="cursor-pointer text-[10px] font-semibold text-slate-300">Network feed settings</summary>
+            <div class="mt-1.5 space-y-1.5">
+              <input id="ltNetworkUrl" type="text" placeholder="https://your-backend.onrender.com/api/live-network" class="w-full bg-slate-900 border border-slate-700 rounded-md px-1.5 py-1 text-[11px]" />
+              <div class="flex items-center gap-1.5">
+                <label class="text-[10px] text-slate-400 shrink-0">Poll:</label>
+                <select id="ltNetInterval" class="flex-1 bg-slate-900 border border-slate-700 rounded-md px-1 py-1 text-[10px]">
+                  <option value="1">Every 1 min</option>
+                  <option value="2">Every 2 min</option>
+                  <option value="3">Every 3 min</option>
+                  <option value="5">Every 5 min</option>
+                  <option value="10">Every 10 min</option>
+                  <option value="15">Every 15 min</option>
+                </select>
+              </div>
+              <div class="text-[9px] text-slate-400 leading-snug">Polls your free NTES junction-board proxy (`live_network_server.py`) automatically on open to show all running trains across WADI, KLBG, SUR, KWV, DD, MRJ &amp; LUR.</div>
+            </div>
+          </details>
+          <div id="ltNetworkErr" class="hidden rounded-lg border border-amber-500/40 bg-amber-500/10 text-amber-200 text-[10px] px-2 py-1.5 space-y-1">
+            <div id="ltNetworkErrMsg"></div>
+            <div class="flex gap-2">
+              <button id="ltRetryNetBtn" type="button" class="underline font-semibold text-emerald-300 cursor-pointer">Retry</button>
+              <button id="ltSwitchDemoBtn" type="button" class="underline font-semibold text-violet-300 cursor-pointer">Switch to Demo</button>
+            </div>
+          </div>
+        </div>
+
+        <div id="ltDemoNote" class="rounded-lg border border-violet-500/40 bg-violet-500/10 text-violet-200 text-[10px] px-2 py-1.5">
+          Demo mode: these trains are <b>simulated</b> on your corridors (dashed markers). They are not real train positions. Switch Source to <b>Live Network</b> for all running trains or <b>Single-Train API</b> for individual lookups.
+        </div>
+
+        <div id="ltLiveBox" class="hidden space-y-1.5">
+          <details class="bg-slate-800/70 border border-slate-700 rounded-lg px-2 py-1.5">
+            <summary class="cursor-pointer text-[10px] font-semibold text-slate-300">API settings</summary>
+            <div class="mt-1.5 space-y-1.5">
+              <input id="ltBase" type="text" placeholder="Base URL" class="w-full bg-slate-900 border border-slate-700 rounded-md px-1.5 py-1 text-[11px]" />
+              <input id="ltKey" type="password" placeholder="API key" autocomplete="off" class="w-full bg-slate-900 border border-slate-700 rounded-md px-1.5 py-1 text-[11px]" />
+              <div class="flex gap-1.5">
+                <select id="ltAuth" class="flex-1 bg-slate-900 border border-slate-700 rounded-md px-1 py-1 text-[10px]">
+                  <option value="header">RailRadar (Authorization header)</option>
+                  <option value="query">RailRadar (?apiKey= param)</option>
+                  <option value="rapidapi">RapidAPI (x-rapidapi-key)</option>
+                </select>
+                <select id="ltInterval" class="w-24 bg-slate-900 border border-slate-700 rounded-md px-1 py-1 text-[10px]">
+                  <option value="1">Every 1 min</option>
+                  <option value="2">Every 2 min</option>
+                  <option value="5">Every 5 min</option>
+                  <option value="10">Every 10 min</option>
+                  <option value="15">Every 15 min</option>
+                </select>
+              </div>
+              <div class="text-[9px] text-slate-400 leading-snug">The key is stored in this browser only. For a public site, point Base URL at your own backend proxy so the key is never exposed.</div>
+            </div>
+          </details>
+          <div class="flex gap-1.5">
+            <input id="ltAddInput" type="text" placeholder="Train no. e.g. 12115" class="flex-1 min-w-0 bg-slate-800 border border-slate-700 rounded-md px-2 py-1 text-[11px]" />
+            <button id="ltAddBtn" type="button" class="bg-emerald-600 hover:bg-emerald-500 text-white font-semibold px-2.5 py-1 rounded-md text-[11px] cursor-pointer">Track</button>
+          </div>
+          <div id="ltUsage" class="text-[10px] text-slate-400"></div>
+        </div>
+
+        <div id="ltList"></div>
+
+        <div class="flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-slate-400 pt-1 border-t border-slate-800">
+          <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full" style="background:#10b981"></span>≤5m</span>
+          <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full" style="background:#f59e0b"></span>≤15m</span>
+          <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full" style="background:#f97316"></span>≤45m</span>
+          <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full" style="background:#ef4444"></span>&gt;45m</span>
+          <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full" style="background:#64748b"></span>not started</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Toast Notification Banner -->
+    <div id="toastBanner" class="hidden absolute top-24 left-1/2 -translate-x-1/2 z-[1100] bg-slate-900/95 border border-emerald-500/50 text-slate-100 text-xs px-4 py-2 rounded-full shadow-2xl"></div>
+
+
+  </div>
+
+  <script>
+    (function () {
+      // EXACT user-provided Station Coordinates (87 stations)
+      const stationCoords = {"WADI": {"lat": 17.05303569516522, "lon": 76.99204755925912}, "SDB": {"lat": 17.12207211329687, "lon": 76.94370232393466}, "MR": {"lat": 17.199884316888113, "lon": 76.90242140933267}, "HQR": {"lat": 17.258329320477387, "lon": 76.87213360102963}, "KLBG": {"lat": 17.31464128074813, "lon": 76.82539943154254}, "TJSP": {"lat": 17.38155787142842, "lon": 76.83078651026582}, "BBD": {"lat": 17.336940866375414, "lon": 76.7792743961494}, "SVG": {"lat": 17.33968072788599, "lon": 76.71139619013732}, "HHD": {"lat": 17.352700945672176, "lon": 76.64674999614954}, "GUR": {"lat": 17.340847607132325, "lon": 76.5895995384797}, "KUI": {"lat": 17.357481126320312, "lon": 76.47050033971526}, "DUD": {"lat": 17.36262542350625, "lon": 76.38023255381961}, "NGS": {"lat": 17.429201164736277, "lon": 76.18296853848099}, "BOT": {"lat": 17.395116057678774, "lon": 76.25531964887394}, "AKOR": {"lat": 17.450540923674154, "lon": 76.13878780964653}, "TLT": {"lat": 17.529150347297044, "lon": 76.03601785680922}, "HG STN": {"lat": 17.565461287426693, "lon": 75.9894306025621}, "HG 'A' Cabin": {"lat": 17.555916499098096, "lon": 76.00138432588585}, "TKWD": {"lat": 17.615367249178764, "lon": 75.93344533709772}, "SUR": {"lat": 17.66461685325021, "lon": 75.8934378261056}, "BALE": {"lat": 17.67603540641838, "lon": 75.84576721149409}, "PK": {"lat": 17.725604941699864, "lon": 75.77920258081592}, "MVE": {"lat": 17.742039265808994, "lon": 75.70628187232433}, "MO": {"lat": 17.805775747199327, "lon": 75.67562640965197}, "MKPT": {"lat": 17.876348021475454, "lon": 75.63508125440458}, "AAG": {"lat": 17.928577532396076, "lon": 75.60830992499343}, "WKA": {"lat": 17.98027395125776, "lon": 75.58849669615935}, "MA": {"lat": 18.030290184953223, "lon": 75.54656926732524}, "WDS": {"lat": 18.06648098233323, "lon": 75.4889207249956}, "KWV": {"lat": 18.09222393527959, "lon": 75.41722014404814}, "DHS": {"lat": 18.12955847910344, "lon": 75.33424703664774}, "KEM": {"lat": 18.176853463202423, "lon": 75.27468572499728}, "BLNI": {"lat": 18.210581627334815, "lon": 75.20717558551391}, "JEUR": {"lat": 18.260861679574607, "lon": 75.16233780965912}, "PPJ": {"lat": 18.291563656218496, "lon": 75.09802889616424}, "WSB": {"lat": 18.280298357551207, "lon": 75.01623199616414}, "KEU": {"lat": 18.290095464926527, "lon": 74.95250352348742}, "JNTR": {"lat": 18.324947721792178, "lon": 74.8776102384951}, "BGVN": {"lat": 18.316891480050153, "lon": 74.77494537837337}, "MLM": {"lat": 18.368948833491366, "lon": 74.72444118537874}, "BRB": {"lat": 18.407915112523582, "lon": 74.6490078310967}, "MRJ": {"lat": 16.81963598398112, "lon": 74.63884656730691}, "BLWD": {"lat": 16.816450353858315, "lon": 74.6848784309091}, "BDK": {"lat": 16.82260514883158, "lon": 74.73242941035451}, "ARAG": {"lat": 16.822915416337786, "lon": 74.78885649248846}, "BLNK": {"lat": 16.851881572150898, "lon": 74.87035305369132}, "SGRE": {"lat": 16.89299615360604, "lon": 74.90379065076426}, "AGDl": {"lat": 16.95511622318343, "lon": 74.9217523566787}, "KVK": {"lat": 16.993451321113707, "lon": 74.93640413701563}, "LNP": {"lat": 17.08409186087585, "lon": 74.96648999614565}, "DLGN": {"lat": 17.12248941189781, "lon": 74.99090321680957}, "GLV": {"lat": 17.172780301899458, "lon": 75.05616359877327}, "JTRD": {"lat": 17.218097953252496, "lon": 75.11167313571244}, "MSDG": {"lat": 17.269767344711966, "lon": 75.13869487464056}, "JVA": {"lat": 17.29927168818127, "lon": 75.15831072498368}, "WSD": {"lat": 17.37772780658702, "lon": 75.14796632741995}, "SGLA": {"lat": 17.436927805442046, "lon": 75.18841716855994}, "BMNI": {"lat": 17.510679238270942, "lon": 75.23653144358765}, "BHLI": {"lat": 17.588890463817744, "lon": 75.27444374355429}, "PVR": {"lat": 17.66895109379127, "lon": 75.31975306090992}, "BBV": {"lat": 17.76904752111648, "lon": 75.39791698431098}, "AHI": {"lat": 17.845027674667048, "lon": 75.40338896837972}, "MLB": {"lat": 17.91701602096594, "lon": 75.40538340426733}, "PSS": {"lat": 18.000856885777456, "lon": 75.38989817631149}, "LAUL": {"lat": 18.03355629204764, "lon": 75.39532863007801}, "CNHL": {"lat": 18.099881017907574, "lon": 75.45785352269934}, "MGO": {"lat": 18.1096021568062, "lon": 75.49542122315127}, "SEI": {"lat": 18.149389148247096, "lon": 75.59026142499687}, "UPI": {"lat": 18.179945557118465, "lon": 75.6356972899416}, "BTW": {"lat": 18.240970610084844, "lon": 75.71804892625418}, "KCB": {"lat": 18.279056755382747, "lon": 75.78166860372836}, "PJR": {"lat": 18.283948752266966, "lon": 75.86723131577448}, "DRSV": {"lat": 18.247878328931048, "lon": 76.02287892615388}, "YSI": {"lat": 18.317606171075578, "lon": 75.97700896898456}, "KRMD": {"lat": 18.371892606761342, "lon": 76.04928088248217}, "DKY": {"lat": 18.353691655460597, "lon": 76.10311836170408}, "TER": {"lat": 18.35266581335599, "lon": 76.15005236994277}, "PCP": {"lat": 18.3584179274254, "lon": 76.19327000536276}, "MRX": {"lat": 18.380274853550898, "lon": 76.25111538019095}, "NEI": {"lat": 18.3873686007519, "lon": 76.31091170451272}, "OSA": {"lat": 18.378479646870694, "lon": 76.40761212644625}, "HGL": {"lat": 18.390199985034297, "lon": 76.49591856320265}, "LUR": {"lat": 18.429426709423403, "lon": 76.5560806337212}, "BANL": {"lat": 18.44605226022196, "lon": 76.67840203837198}, "GANI": {"lat": 18.479267109518492, "lon": 76.76394964918596}, "DD": {"lat": 18.46377428753149, "lon": 74.57928783698621}, "GDGN": {"lat": 17.336411428562005, "lon": 76.53157311517725}};  
+
+      // EXACT user-provided Station Metadata
+      const stationMeta = {"WADI": {"km": 604.62, "type": "Junction", "facilities": "ART/ARME", "line": "Double Line"}, "SDB": {"km": 594.32, "type": "Station", "facilities": "", "line": "Double Line"}, "MR": {"km": 584.11, "type": "Station", "facilities": "", "line": "Double Line"}, "HQR": {"km": 577.67, "type": "Station", "facilities": "BPCL siding", "line": "Double Line"}, "KLBG": {"km": 567.95, "type": "Junction", "facilities": "Coaching Depot", "line": "Double Line"}, "TJSP": {"km": 579.85, "type": "Station", "facilities": "", "line": "Single Line"}, "BBD": {"km": 562.53, "type": "Station", "facilities": "", "line": "Double Line"}, "SVG": {"km": 554.95, "type": "Station", "facilities": "", "line": "Double Line"}, "HHD": {"km": 547.9, "type": "Station", "facilities": "", "line": "Double Line"}, "GUR": {"km": 541.32, "type": "Station", "facilities": "", "line": "Double Line"}, "GDGN": {"km": 535.17, "type": "Station", "facilities": "", "line": "Double Line"}, "KUI": {"km": 527.96, "type": "Station", "facilities": "", "line": "Double Line"}, "DUD": {"km": 518.13, "type": "Station", "facilities": "", "line": "Double Line"}, "BOT": {"km": 504.47, "type": "Station", "facilities": "", "line": "Double Line"}, "NGS": {"km": 495.49, "type": "Station", "facilities": "", "line": "Double Line"}, "AKOR": {"km": 490.37, "type": "Station", "facilities": "", "line": "Double Line"}, "TLT": {"km": 476.49, "type": "Station", "facilities": "Chettinad Cement, ZCT Cement", "line": "Double Line"}, "HG 'A' Cabin": {"km": 471.3, "type": "Cabin", "facilities": "Zuari Cement", "line": "Double Line"}, "HG STN": {"km": 470.4, "type": "Junction", "facilities": "", "line": "Double Line"}, "TKWD": {"km": 461.98, "type": "Station", "facilities": "", "line": "Double Line"}, "SUR": {"km": 454.97, "type": "Station", "facilities": "Coaching Depot, Vande Bharat Depot, Railway Hospital, ART, SPARME", "line": "Double Line"}, "BALE": {"km": 448.7, "type": "Station", "facilities": "", "line": "Double Line"}, "PK": {"km": 438.69, "type": "Station", "facilities": "IOC", "line": "Double Line"}, "MVE": {"km": 429.63, "type": "Station", "facilities": "", "line": "Double Line"}, "MO": {"km": 421.86, "type": "Station", "facilities": "", "line": "Double Line"}, "MKPT": {"km": 412.75, "type": "Station", "facilities": "", "line": "Double Line"}, "AAG": {"km": 405.66, "type": "Station", "facilities": "", "line": "Double Line"}, "WKA": {"km": 399.37, "type": "Station", "facilities": "", "line": "Double Line"}, "MA": {"km": 392.07, "type": "Station", "facilities": "", "line": "Double Line"}, "WDS": {"km": 384.51, "type": "Station", "facilities": "", "line": "Double Line"}, "KWV": {"km": 376.28, "type": "Junction", "facilities": "Workshop", "line": "Double Line"}, "DHS": {"km": 366.56, "type": "Station", "facilities": "", "line": "Double Line"}, "KEM": {"km": 358, "type": "Station", "facilities": "", "line": "Double Line"}, "BLNI": {"km": 349.67, "type": "Station", "facilities": "", "line": "Double Line"}, "JEUR": {"km": 341.94, "type": "Station", "facilities": "", "line": "Double Line"}, "PPJ": {"km": 333.3, "type": "Station", "facilities": "", "line": "Double Line"}, "WSB": {"km": 323.34, "type": "Station", "facilities": "", "line": "Double Line"}, "KEU": {"km": 316.25, "type": "Station", "facilities": "", "line": "Double Line"}, "JNTR": {"km": 306.9, "type": "Station", "facilities": "", "line": "Double Line"}, "BGVN": {"km": 294.6, "type": "Station", "facilities": "", "line": "Double Line"}, "MLM": {"km": 286.78, "type": "Station", "facilities": "", "line": "Double Line"}, "BRB": {"km": 277.43, "type": "Station", "facilities": "", "line": "Double Line"}, "BLWD": {"km": "", "type": "Station", "facilities": "", "line": "Single Line"}, "BDK": {"km": "", "type": "Station", "facilities": "", "line": "Single Line"}, "ARAG": {"km": 547.93, "type": "Station", "facilities": "", "line": "Single Line"}, "BLNK": {"km": 537.68, "type": "Station", "facilities": "", "line": "Single Line"}, "SGRE": {"km": 531.48, "type": "Station", "facilities": "", "line": "Single Line"}, "AGDl": {"km": "", "type": "Station", "facilities": "", "line": "Single Line"}, "KVK": {"km": 519.95, "type": "Station", "facilities": "", "line": "Single Line"}, "LNP": {"km": 508.7, "type": "Station", "facilities": "", "line": "Single Line"}, "DLGN": {"km": 503.8, "type": "Station", "facilities": "", "line": "Single Line"}, "GLV": {"km": "", "type": "Station", "facilities": "", "line": "Single Line"}, "JTRD": {"km": 485.7, "type": "Station", "facilities": "", "line": "Single Line"}, "MSDG": {"km": 479.14, "type": "Station", "facilities": "", "line": "Single Line"}, "JVA": {"km": 475.19, "type": "Station", "facilities": "", "line": "Single Line"}, "WSD": {"km": 466.33, "type": "Station", "facilities": "", "line": "Single Line"}, "SGLA": {"km": 458.46, "type": "Station", "facilities": "", "line": "Single Line"}, "BMNI": {"km": "", "type": "Station", "facilities": "", "line": "Single Line"}, "BHLI": {"km": "", "type": "Station", "facilities": "", "line": "Single Line"}, "PVR": {"km": 428.67, "type": "Station", "facilities": "", "line": "Single Line"}, "BBV": {"km": "", "type": "Station", "facilities": "", "line": "Single Line"}, "AHI": {"km": "", "type": "Station", "facilities": "", "line": "Single Line"}, "MLB": {"km": 398.33, "type": "Station", "facilities": "", "line": "Single Line"}, "PSS": {"km": "", "type": "Station", "facilities": "", "line": "Single Line"}, "LAUL": {"km": "", "type": "Station", "facilities": "", "line": "Single Line"}, "CNHL": {"km": "", "type": "Station", "facilities": "", "line": "Single Line"}, "MGO": {"km": "", "type": "Station", "facilities": "", "line": "Single Line"}, "SEI": {"km": 396.18, "type": "Station", "facilities": "", "line": "Single Line"}, "UPI": {"km": "", "type": "Station", "facilities": "", "line": "Single Line"}, "BTW": {"km": 413.56, "type": "Station", "facilities": "", "line": "Single Line"}, "KCB": {"km": "", "type": "Station", "facilities": "", "line": "Single Line"}, "PJR": {"km": 431.41, "type": "Station", "facilities": "", "line": "Single Line"}, "DRSV": {"km": 450.3, "type": "Station", "facilities": "", "line": "Single Line"}, "YSI": {"km": 460.38, "type": "Station", "facilities": "", "line": "Single Line"}, "KRMD": {"km": 470.87, "type": "Station", "facilities": "", "line": "Single Line"}, "DKY": {"km": 476.99, "type": "Station", "facilities": "", "line": "Single Line"}, "TER": {"km": 493.31, "type": "Station", "facilities": "", "line": "Single Line"}, "PCP": {"km": "", "type": "Station", "facilities": "", "line": "Single Line"}, "MRX": {"km": "", "type": "Station", "facilities": "", "line": "Single Line"}, "NEI": {"km": "", "type": "Station", "facilities": "", "line": "Single Line"}, "OSA": {"km": 510.79, "type": "Station", "facilities": "", "line": "Single Line"}, "HGL": {"km": 520.74, "type": "Station", "facilities": "MRCF", "line": "Single Line"}, "LUR": {"km": 529.53, "type": "Station", "facilities": "", "line": "Single Line"}, "BANL": {"km": "", "type": "Station", "facilities": "", "line": "Single Line"}, "GANI": {"km": "", "type": "Station", "facilities": "", "line": "Single Line"}, "MRJ": {"km": "", "type": "Junction", "facilities": "", "line": "Single Line"}, "DD": {"km": "", "type": "Junction", "facilities": "", "line": "Double Line"}};
+
+      const bridges = [{"name": "Cogni Bridge", "km": 596.1, "line": "Double Line", "color": "#059669", "lat": 17.10274236907395, "lon": 76.9533265075126}, {"name": "Murridge Bridge", "km": 538.2, "line": "Double Line", "color": "#059669", "lat": 17.338904557578417, "lon": 76.55951027424256}, {"name": "Bori Bridge", "km": 511.2, "line": "Double Line", "color": "#059669", "lat": 17.37949916611666, "lon": 76.32191485548302}, {"name": "Seena Bridge", "km": 431.1, "line": "Double Line", "color": "#2563eb", "lat": 17.73073846982782, "lon": 75.71873990146156}, {"name": "Pandhara Bridge", "km": 326.1, "line": "Double Line", "color": "#d97706", "lat": 18.27673056769698, "lon": 75.04481562148186}, {"name": "Bhopal Peth Bridge", "km": 317.1, "line": "Double Line", "color": "#d97706", "lat": 18.290712850734177, "lon": 74.96778652719722}, {"name": "Hingani Bridge", "km": 315.1, "line": "Double Line", "color": "#d97706", "lat": 18.292178512562195, "lon": 74.9418111820813}, {"name": "Bhima Bridge (North)", "km": 301.1, "line": "Double Line", "color": "#d97706", "lat": 18.321506949881847, "lon": 74.83211275942939}, {"name": "Bhima Bridge (South)", "km": 425.1, "line": "Single Line", "color": "#7c3aed", "lat": 17.69138780344855, "lon": 75.33060031594701}, {"name": "Gad Deodari Bridge", "km": 446.2, "line": "Single Line", "color": "#0891b2", "lat": 18.256956242772816, "lon": 75.98667018852206}, {"name": "Manjara Bridge", "km": 541.1, "line": "Single Line", "color": "#0891b2", "lat": 18.442470009606655, "lon": 76.66796349867437}];
+      const levelCrossings = [{"name": "LC-3", "station": "WADI", "lat": 17.045459723006925, "lon": 76.9991692531364, "km": "604/4-5", "dept": "Traffic", "status": "Interlocked", "op": "Railway"}, {"name": "LC-2", "station": "WADI", "lat": 17.05991537122508, "lon": 76.99268889877933, "km": "603/7-8", "dept": "Engineering", "status": "Interlocked", "op": "Railway"}, {"name": "LC-1", "station": "WADI", "lat": 17.061464134206158, "lon": 76.99294102641343, "km": "603/7-8", "dept": "Engineering", "status": "Interlocked", "op": "Railway"}, {"name": "LC-91", "station": "WADI", "lat": 17.0730377960139, "lon": 76.99331311476618, "km": "602/4-5", "dept": "Engineering", "status": "Interlocked", "op": "Railway"}, {"name": "LC-82", "station": "KLBG", "lat": 17.327642795681253, "lon": 76.79777067792214, "km": "564/7-8", "dept": "Engineering", "status": "Interlocked", "op": "Railway"}, {"name": "LC-74", "station": "DUD", "lat": 17.368042875272664, "lon": 76.35544847261099, "km": "415/5-6", "dept": "Engineering", "status": "Interlocked", "op": "Railway"}, {"name": "LC-66", "station": "AKOR", "lat": 17.44943948572111, "lon": 76.14252869934077, "km": "490/8-9", "dept": "Traffic", "status": "Interlocked", "op": "Mesco /RG-Rly"}, {"name": "LC-61", "station": "TLT", "lat": 17.52479029942607, "lon": 76.0419046778181, "km": "477/2-3", "dept": "Traffic", "status": "Interlocked", "op": "Mesco /RG-Rly"}, {"name": "LC-60A", "station": "HG Yard", "lat": 17.561711679015932, "lon": 75.99502964881724, "km": "UTCL/HG", "dept": "UTCL", "status": "Interlocked", "op": "UTCL/HG"}, {"name": "LC-1 (NTPC)", "station": "NTPC/HG", "lat": 17.55101606486515, "lon": 75.99596971405622, "km": "NTPC/HG", "dept": "NTPC", "status": "Interlocked", "op": "NTPC/HG"}, {"name": "LC-42", "station": "MA", "lat": 18.03294730603569, "lon": 75.54421976446122, "km": "391/8-9", "dept": "Traffic", "status": "Interlocked", "op": "Mesco /RG-Rly"}, {"name": "LC-40", "station": "MA", "lat": 18.05663945856314, "lon": 75.51302476934481, "km": "387/3-4", "dept": "Engineering", "status": "Interlocked", "op": "Mesco /RG-Rly"}, {"name": "LC-21", "station": "BGVN", "lat": 18.3176900955227, "lon": 74.77141287578472, "km": "294/6-7", "dept": "Traffic", "status": "Interlocked", "op": "Mesco /RG-Rly"}, {"name": "LC-19A", "station": "DD", "lat": 18.453088326777802, "lon": 74.61765608307691, "km": "271/3-4", "dept": "Engineering", "status": "Interlocked", "op": "Railway"}, {"name": "LC-6", "station": "LTRR", "lat": 18.476157126304702, "lon": 76.75708873923493, "km": "552/1-2", "dept": "Engineering", "status": "Interlocked", "op": "Railway"}, {"name": "LC-5", "station": "LTRR", "lat": 18.465011440555564, "lon": 76.7387122691863, "km": "549/8-9", "dept": "Engineering", "status": "Interlocked", "op": "Mesco"}, {"name": "LC-4", "station": "LUR", "lat": 18.452371267956092, "lon": 76.70321050792755, "km": "545/7-8", "dept": "Engineering", "status": "Interlocked", "op": "Mesco"}, {"name": "LC-2", "station": "WADI", "lat": 18.42332372888592, "lon": 76.59393320826118, "km": "603/7-8", "dept": "Engineering", "status": "Interlocked", "op": "Railway"}, {"name": "LC-59", "station": "HGL", "lat": 18.420416815874642, "lon": 76.52195426455327, "km": "525/2-3", "dept": "Engineering", "status": "Interlocked", "op": "Mesco /RG-Rly"}, {"name": "LC-55", "station": "HGL", "lat": 18.38537838715342, "lon": 76.48059241884654, "km": "519/0-1", "dept": "Engineering", "status": "Interlocked", "op": "Mesco /RG-Rly"}, {"name": "LC-47", "station": "OSA", "lat": 18.386228145130044, "lon": 76.31466459630478, "km": "500/4-5", "dept": "Engineering", "status": "Interlocked", "op": "Railway"}, {"name": "LC-39", "station": "DKY", "lat": 18.356313298828827, "lon": 76.1770885763997, "km": "484/9-10", "dept": "Engineering", "status": "Interlocked", "op": "Mesco /RG-Rly"}, {"name": "LC-36", "station": "DKY", "lat": 18.352081565223166, "lon": 76.10690113916833, "km": "477/4-5", "dept": "Traffic", "status": "Interlocked", "op": "Mesco /RG-Rly"}, {"name": "LC-34", "station": "DKY", "lat": 18.365442142034457, "lon": 76.07146765194734, "km": "473/4-5", "dept": "Engineering", "status": "Interlocked", "op": "Railway"}, {"name": "LC-10", "station": "BTW", "lat": 18.208862406271134, "lon": 75.68524800699691, "km": "408/4-5", "dept": "Engineering", "status": "Interlocked", "op": "Mesco /RG-Rly"}, {"name": "LC-22", "station": "PVR", "lat": 17.700038978877433, "lon": 75.33613801343402, "km": "424/7-8", "dept": "Engineering", "status": "Interlocked", "op": "Mesco"}, {"name": "LC-24", "station": "PVR", "lat": 17.64904910116042, "lon": 75.30356874186735, "km": "431/7-8", "dept": "Engineering", "status": "Interlocked", "op": "Mesco"}, {"name": "LC-31", "station": "SGLA", "lat": 17.44462018694254, "lon": 75.1942099165522, "km": "457/2-3", "dept": "Traffic", "status": "Interlocked", "op": "Mesco /RG-Rly"}, {"name": "LC-49", "station": "KVK", "lat": 17.00208269430725, "lon": 74.93916403253746, "km": "518/5-6", "dept": "Traffic", "status": "Interlocked", "op": "Mesco /RG-Rly"}, {"name": "LC-70", "station": "MRJ", "lat": 16.809023009736215, "lon": 74.66435280028696, "km": "561/6-7", "dept": "Engineering", "status": "Interlocked", "op": "Mesco /RG-Rly"}];
+
+      // EXACT user-provided Division Boundaries (7 boundaries)
+      const boundaries = [
+        { name: "Central Railway Boundary (VKB)", km: "607.5", line: "Double Line", lat: 17.046707468334073, lon: 77.00570589860189, color: "#059669" },
+        { name: "Central Railway Boundary (RC)", km: "606.3", line: "Double Line", lat: 17.028504979068035, lon: 76.9883073852269, color: "#059669" },
+        { name: "Central Railway Boundary (TJSP)", km: "580.9", line: "Single Line", lat: 17.394224893809678, lon: 76.84264624683904, color: "#e11d48" },
+        { name: "Central Railway Boundary (TVL)", km: "472.6", line: "Double Line", lat: 17.537559042263165, lon: 75.99551199762034, color: "#059669" },
+        { name: "Solapur Division Boundary (DD)", km: "270", line: "Double Line", lat: 18.454828078618277, lon: 74.61430074411761, color: "#d97706" },
+        { name: "Solapur Division Boundary (MRJ)", km: "281.26", line: "Single Line", lat: 16.808801673402446, lon: 74.65481023914428, color: "#7c3aed" },
+        { name: "Central Railway Boundary (LTRR)", km: "561.7", line: "Single Line", lat: 18.508665538961562, lon: 76.82697937961511, color: "#0891b2" }
+      ];
+
+
+      // Signal Locations from Solapur_Division_Signal_Locations.xlsx (687 signals)
+      const signalsData = [{"sr":2,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"SUR","name":"Starter","mast":"455.25","km":455.25,"side":"LHS","rem":""},{"sr":3,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"SUR","name":"Adv. Starter","mast":"456.25","km":456.25,"side":"LHS","rem":""},{"sr":4,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"TKWD","name":"Distant","mast":"458.6","km":458.6,"side":"LHS","rem":""},{"sr":5,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"TKWD","name":"Inner Distant","mast":"460.15","km":460.15,"side":"LHS","rem":""},{"sr":6,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"TKWD","name":"Home","mast":"461.15","km":461.15,"side":"LHS","rem":""},{"sr":7,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"TKWD","name":"Starter Main Line","mast":"462.45","km":462.45,"side":"RHS","rem":"Right Hand Signal (S-29)"},{"sr":8,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"TKWD","name":"Adv. Starter","mast":"462.75","km":462.75,"side":"LHS","rem":""},{"sr":9,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"TKWD - HG","name":"Neutral Section","mast":"467.65","km":467.65,"side":"","rem":"Neutral Section"},{"sr":10,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"HG","name":"Distant","mast":"467.2","km":467.2,"side":"LHS","rem":""},{"sr":11,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"HG","name":"Inner Distant","mast":"468.2","km":468.2,"side":"LHS","rem":""},{"sr":12,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"HG","name":"Home","mast":"469.2","km":469.2,"side":"LHS","rem":""},{"sr":13,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"HG","name":"Starter","mast":"470.5","km":470.5,"side":"LHS","rem":""},{"sr":14,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"HG","name":"Inner Starter","mast":"471.25","km":471.25,"side":"LHS","rem":""},{"sr":15,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"HG","name":"Adv. Starter","mast":"472.2","km":472.2,"side":"LHS","rem":""},{"sr":16,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"TLT","name":"Distant","mast":"473.5","km":473.5,"side":"LHS","rem":""},{"sr":17,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"TLT","name":"Inner Distant","mast":"474.45","km":474.45,"side":"LHS","rem":""},{"sr":18,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"TLT","name":"Home","mast":"475.55","km":475.55,"side":"LHS","rem":""},{"sr":19,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"TLT","name":"Starter","mast":"476.8","km":476.8,"side":"LHS","rem":""},{"sr":20,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"TLT","name":"Adv. Starter","mast":"477.55","km":477.55,"side":"LHS","rem":""},{"sr":21,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"AKOR","name":"Distant","mast":"487.15","km":487.15,"side":"LHS","rem":""},{"sr":22,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"AKOR","name":"Inner Distant","mast":"488.2","km":488.2,"side":"LHS","rem":""},{"sr":23,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"AKOR","name":"Home","mast":"489.2","km":489.2,"side":"LHS","rem":""},{"sr":24,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"AKOR","name":"Starter","mast":"490.75","km":490.75,"side":"LHS","rem":""},{"sr":25,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"AKOR","name":"Adv. Starter","mast":"491.15","km":491.15,"side":"LHS","rem":""},{"sr":26,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"NGS","name":"Distant","mast":"493.1","km":493.1,"side":"LHS","rem":""},{"sr":27,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"NGS","name":"Inner Distant","mast":"494.1","km":494.1,"side":"LHS","rem":""},{"sr":28,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"NGS","name":"Home","mast":"495.15","km":495.15,"side":"LHS","rem":""},{"sr":29,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"NGS","name":"Starter","mast":"496.3","km":496.3,"side":"LHS","rem":""},{"sr":30,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"NGS","name":"Adv. Starter","mast":"496.65","km":496.65,"side":"LHS","rem":""},{"sr":31,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"NGS - BOT","name":"Neutral Section","mast":"497.05","km":497.05,"side":"","rem":"Neutral Section"},{"sr":32,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"BOT","name":"Distant","mast":"501.65","km":501.65,"side":"LHS","rem":""},{"sr":33,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"BOT","name":"Inner Distant","mast":"502.8","km":502.8,"side":"LHS","rem":""},{"sr":34,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"BOT","name":"Home","mast":"503.9","km":503.9,"side":"LHS","rem":""},{"sr":35,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"BOT","name":"Starter","mast":"505.1","km":505.1,"side":"LHS","rem":""},{"sr":36,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"BOT","name":"Adv. Starter","mast":"505.55","km":505.55,"side":"LHS","rem":""},{"sr":37,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"Gate (LC 74)","name":"Gate Distant","mast":"513.3","km":513.3,"side":"LHS","rem":""},{"sr":38,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"Gate (LC 74)","name":"Gate Distant LC 74","mast":"514.35","km":514.35,"side":"LHS","rem":""},{"sr":39,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"Gate (LC 74)","name":"Gate cum Distant","mast":"515.3","km":515.3,"side":"LHS","rem":""},{"sr":40,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"DUD","name":"Inner Distant","mast":"516.05","km":516.05,"side":"LHS","rem":""},{"sr":41,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"DUD","name":"Home","mast":"517.1","km":517.1,"side":"LHS","rem":""},{"sr":42,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"DUD","name":"Starter","mast":"518.45","km":518.45,"side":"LHS","rem":""},{"sr":43,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"DUD","name":"Adv. Starter","mast":"518.9","km":518.9,"side":"LHS","rem":""},{"sr":44,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"KUI","name":"Distant","mast":"524.85","km":524.85,"side":"LHS","rem":""},{"sr":45,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"KUI","name":"Inner Distant","mast":"525.85","km":525.85,"side":"LHS","rem":""},{"sr":46,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"KUI","name":"Home","mast":"527.05","km":527.05,"side":"LHS","rem":""},{"sr":47,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"KUI","name":"Main Line Starter","mast":"528.3","km":528.3,"side":"LHS","rem":""},{"sr":48,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"KUI","name":"Adv. Starter","mast":"528.7","km":528.7,"side":"LHS","rem":""},{"sr":49,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"GDGN","name":"Distant","mast":"532.4","km":532.4,"side":"LHS","rem":""},{"sr":50,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"GDGN","name":"Inner Distant","mast":"533.4","km":533.4,"side":"LHS","rem":""},{"sr":51,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"GDGN","name":"Neutral Section","mast":"534.05","km":534.05,"side":"","rem":"Neutral Section"},{"sr":52,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"GDGN","name":"Home","mast":"534.45","km":534.45,"side":"LHS","rem":""},{"sr":53,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"GDGN","name":"Starter","mast":"535.5","km":535.5,"side":"LHS","rem":""},{"sr":54,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"GDGN","name":"Adv. Starter","mast":"535.8","km":535.8,"side":"LHS","rem":""},{"sr":55,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"GUR","name":"Distant","mast":"538.45","km":538.45,"side":"LHS","rem":""},{"sr":56,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"GUR","name":"Inner Distant","mast":"539.45","km":539.45,"side":"LHS","rem":""},{"sr":57,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"GUR","name":"Home","mast":"540.5","km":540.5,"side":"LHS","rem":""},{"sr":58,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"GUR","name":"Starter","mast":"541.7","km":541.7,"side":"LHS","rem":""},{"sr":59,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"GUR","name":"Adv. Starter","mast":"542.15","km":542.15,"side":"LHS","rem":""},{"sr":60,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"SVG","name":"Distant","mast":"552.1","km":552.1,"side":"LHS","rem":""},{"sr":61,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"SVG","name":"Inner Distant","mast":"553.25","km":553.25,"side":"LHS","rem":""},{"sr":62,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"SVG","name":"Home","mast":"554.3","km":554.3,"side":"LHS","rem":""},{"sr":63,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"SVG","name":"Starter","mast":"555.5","km":555.5,"side":"LHS","rem":""},{"sr":64,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"SVG","name":"Adv. Starter","mast":"556.05","km":556.05,"side":"LHS","rem":""},{"sr":65,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"SVG - BBD","name":"Neutral Section","mast":"558.55","km":558.55,"side":"","rem":"Neutral Section"},{"sr":66,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"BBD (C Class)","name":"Distant","mast":"560.6","km":560.6,"side":"LHS","rem":""},{"sr":67,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"BBD (C Class)","name":"Inner Distant","mast":"561.65","km":561.65,"side":"LHS","rem":""},{"sr":68,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"BBD (C Class)","name":"Home","mast":"562.65","km":562.65,"side":"LHS","rem":""},{"sr":69,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"Gate (LC 82)","name":"Gate Distant LC 82","mast":"563.5","km":563.5,"side":"LHS","rem":""},{"sr":70,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"Gate (LC 82)","name":"Gate Signal","mast":"564.5","km":564.5,"side":"LHS","rem":""},{"sr":71,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"KLBG","name":"Inner Distant","mast":"565.5","km":565.5,"side":"LHS","rem":""},{"sr":72,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"KLBG","name":"Home","mast":"566.65","km":566.65,"side":"LHS","rem":""},{"sr":74,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"KLBG","name":"Starter Main Line","mast":"568.5","km":568.5,"side":"LHS","rem":""},{"sr":75,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"KLBG","name":"Adv. Starter","mast":"569.05","km":569.05,"side":"LHS","rem":""},{"sr":78,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"HQR","name":"Distant","mast":"573.5","km":573.5,"side":"LHS","rem":""},{"sr":79,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"HQR","name":"Inner Distant","mast":"574.45","km":574.45,"side":"LHS","rem":""},{"sr":80,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"HQR","name":"Home","mast":"575.5","km":575.5,"side":"LHS","rem":""},{"sr":81,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"HQR","name":"Starter (LSS)","mast":"576.85","km":576.85,"side":"LHS","rem":""},{"sr":82,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"MR","name":"Distant","mast":"581.2","km":581.2,"side":"LHS","rem":""},{"sr":84,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"MR","name":"Inner Distant","mast":"582.25","km":582.25,"side":"LHS","rem":""},{"sr":85,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"MR","name":"Home","mast":"583.35","km":583.35,"side":"LHS","rem":""},{"sr":86,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"MR","name":"Starter","mast":"584.5","km":584.5,"side":"LHS","rem":""},{"sr":87,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"MR","name":"Adv. Starter","mast":"584.95","km":584.95,"side":"LHS","rem":""},{"sr":88,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"MR - SDB","name":"Neutral Section","mast":"585.7","km":585.7,"side":"","rem":"Neutral Section"},{"sr":89,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"SDB","name":"Distant","mast":"591.05","km":591.05,"side":"LHS","rem":""},{"sr":90,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"SDB","name":"Inner Distant","mast":"592.1","km":592.1,"side":"LHS","rem":""},{"sr":92,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"SDB","name":"Home","mast":"593.1","km":593.1,"side":"LHS","rem":""},{"sr":93,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"SDB","name":"Starter","mast":"594.8","km":594.8,"side":"LHS","rem":""},{"sr":94,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"SDB","name":"Adv. Starter","mast":"595.35","km":595.35,"side":"LHS","rem":""},{"sr":95,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"WADI","name":"Distant","mast":"601.2","km":601.2,"side":"LHS","rem":""},{"sr":96,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"WADI","name":"Inner Distant","mast":"602.4","km":602.4,"side":"LHS","rem":""},{"sr":97,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"WADI","name":"Home","mast":"603.3","km":603.3,"side":"LHS","rem":""},{"sr":98,"sec":"SUR-WADI","cid":"c1","dir":-1,"st":"WADI","name":"Routing Home","mast":"604","km":604.0,"side":"LHS","rem":""},{"sr":99,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"WADI","name":"Starter (PF 1)","mast":"604.45","km":604.45,"side":"LHS","rem":""},{"sr":100,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"WADI","name":"Starter (PF-2)","mast":"604.5","km":604.5,"side":"LHS","rem":""},{"sr":101,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"WADI","name":"Starter (PF 3)","mast":"604.225","km":604.225,"side":"LHS","rem":""},{"sr":102,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"WADI","name":"Starter (PF-4)","mast":"604.425","km":604.425,"side":"LHS","rem":""},{"sr":103,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"WADI","name":"Intermediate Starter (for PF-1 & 2)","mast":"604.175","km":604.175,"side":"LHS","rem":""},{"sr":104,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"WADI","name":"Adv. Starter","mast":"603.575","km":603.575,"side":"LHS","rem":""},{"sr":105,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"WADI - SDB","name":"Gate Signal","mast":"602.725","km":602.725,"side":"RHS","rem":"Right Hand Signal (Gate No. 91)"},{"sr":106,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"SDB","name":"Distant","mast":"597.575","km":597.575,"side":"LHS","rem":""},{"sr":107,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"SDB","name":"Inner Distant","mast":"596.375","km":596.375,"side":"LHS","rem":""},{"sr":108,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"SDB","name":"Home","mast":"595.375","km":595.375,"side":"LHS","rem":""},{"sr":109,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"SDB","name":"Starter","mast":"594.125","km":594.125,"side":"LHS","rem":""},{"sr":111,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"SDB","name":"Adv. Starter","mast":"593.825","km":593.825,"side":"LHS","rem":""},{"sr":112,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"MR","name":"Distant","mast":"587.475","km":587.475,"side":"LHS","rem":""},{"sr":113,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"SDB - MR","name":"Neutral Section","mast":"586.725","km":586.725,"side":"","rem":"Neutral Section"},{"sr":114,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"MR","name":"Inner Distant","mast":"586.425","km":586.425,"side":"LHS","rem":""},{"sr":115,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"MR","name":"Home","mast":"585.025","km":585.025,"side":"LHS","rem":""},{"sr":117,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"MR","name":"Starter","mast":"583.875","km":583.875,"side":"LHS","rem":""},{"sr":118,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"MR","name":"Adv. Starter","mast":"583.425","km":583.425,"side":"LHS","rem":""},{"sr":119,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"HQR","name":"Distant","mast":"579.575","km":579.575,"side":"LHS","rem":""},{"sr":120,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"HQR","name":"Inner Distant","mast":"578.325","km":578.325,"side":"LHS","rem":""},{"sr":121,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"HQR","name":"Home","mast":"577.325","km":577.325,"side":"LHS","rem":""},{"sr":122,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"HQR","name":"Starter","mast":"576.275","km":576.275,"side":"LHS","rem":""},{"sr":123,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"HQR","name":"Adv. Starter","mast":"575.725","km":575.725,"side":"LHS","rem":""},{"sr":124,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"KLBG","name":"Distant","mast":"571.275","km":571.275,"side":"LHS","rem":""},{"sr":125,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"KLBG","name":"Inner Distant","mast":"570.275","km":570.275,"side":"LHS","rem":""},{"sr":126,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"KLBG","name":"Home","mast":"569.125","km":569.125,"side":"LHS","rem":""},{"sr":128,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"KLBG","name":"Starter 1/common","mast":"567.825","km":567.825,"side":"LHS","rem":""},{"sr":129,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"KLBG","name":"Adv. Starter","mast":"566.675","km":566.675,"side":"LHS","rem":""},{"sr":131,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"Gate","name":"Distant","mast":"566.025","km":566.025,"side":"LHS","rem":""},{"sr":132,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"Gate","name":"Gate Signal","mast":"564.825","km":564.825,"side":"LHS","rem":""},{"sr":133,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"BBD C CLASS","name":"Distant","mast":"564.375","km":564.375,"side":"LHS","rem":""},{"sr":134,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"BBD C CLASS","name":"Inner Distant","mast":"563.325","km":563.325,"side":"LHS","rem":""},{"sr":135,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"BBD C CLASS","name":"Home","mast":"562.325","km":562.325,"side":"LHS","rem":""},{"sr":136,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"BBD - SVG","name":"Neutral Section","mast":"558.375","km":558.375,"side":"","rem":"Neutral Section"},{"sr":137,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"SVG","name":"Distant","mast":"558.125","km":558.125,"side":"LHS","rem":""},{"sr":138,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"SVG","name":"Inner Distant","mast":"557.125","km":557.125,"side":"LHS","rem":""},{"sr":139,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"SVG","name":"Home","mast":"556.075","km":556.075,"side":"LHS","rem":""},{"sr":140,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"SVG","name":"Starter (ML & 1)","mast":"554.775","km":554.775,"side":"LHS","rem":""},{"sr":141,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"SVG","name":"Adv. Starter","mast":"554.375","km":554.375,"side":"LHS","rem":""},{"sr":142,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"GUR","name":"Distant","mast":"544.325","km":544.325,"side":"LHS","rem":""},{"sr":143,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"GUR","name":"Inner Distant","mast":"543.225","km":543.225,"side":"LHS","rem":""},{"sr":144,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"GUR","name":"Home","mast":"542.325","km":542.325,"side":"LHS","rem":""},{"sr":145,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"GUR","name":"Starter","mast":"541.075","km":541.075,"side":"LHS","rem":""},{"sr":146,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"GUR","name":"Adv. Starter","mast":"540.575","km":540.575,"side":"LHS","rem":""},{"sr":147,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"GDGN","name":"Distant","mast":"537.825","km":537.825,"side":"LHS","rem":""},{"sr":148,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"GDGN","name":"Inner Distant","mast":"536.775","km":536.775,"side":"LHS","rem":""},{"sr":149,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"GDGN","name":"Home","mast":"535.875","km":535.875,"side":"LHS","rem":""},{"sr":150,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"GDGN","name":"Starter","mast":"534.875","km":534.875,"side":"LHS","rem":""},{"sr":151,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"GDGN","name":"Adv. Starter","mast":"534.525","km":534.525,"side":"LHS","rem":""},{"sr":152,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"GDGN - KUI","name":"Neutral Section","mast":"532.725","km":532.725,"side":"","rem":"Neutral Section"},{"sr":153,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"KUI","name":"Distant","mast":"530.825","km":530.825,"side":"LHS","rem":""},{"sr":154,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"KUI","name":"Inner Distant","mast":"529.825","km":529.825,"side":"LHS","rem":""},{"sr":155,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"KUI","name":"Home","mast":"528.775","km":528.775,"side":"LHS","rem":""},{"sr":156,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"KUI","name":"Starter (ML)","mast":"527.525","km":527.525,"side":"LHS","rem":""},{"sr":157,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"KUI","name":"Adv. Starter","mast":"527.075","km":527.075,"side":"LHS","rem":""},{"sr":158,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"DUD","name":"Distant","mast":"521.075","km":521.075,"side":"LHS","rem":""},{"sr":159,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"DUD","name":"Inner Distant","mast":"520.025","km":520.025,"side":"LHS","rem":""},{"sr":160,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"DUD","name":"Home","mast":"518.975","km":518.975,"side":"LHS","rem":""},{"sr":161,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"DUD","name":"Starter","mast":"517.575","km":517.575,"side":"LHS","rem":""},{"sr":162,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"DUD / Gate","name":"Adv. Starter cum Gate Distant","mast":"517.125","km":517.125,"side":"LHS","rem":""},{"sr":163,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"Gate","name":"Gate Signal","mast":"515.675","km":515.675,"side":"LHS","rem":""},{"sr":164,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"BOT","name":"Distant","mast":"507.575","km":507.575,"side":"LHS","rem":""},{"sr":165,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"BOT","name":"Inner Distant","mast":"506.625","km":506.625,"side":"LHS","rem":""},{"sr":166,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"BOT","name":"Home","mast":"505.675","km":505.675,"side":"LHS","rem":""},{"sr":167,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"BOT","name":"Starter","mast":"504.425","km":504.425,"side":"LHS","rem":""},{"sr":168,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"BOT","name":"Adv. Starter","mast":"503.925","km":503.925,"side":"LHS","rem":""},{"sr":169,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"NGS","name":"Distant","mast":"498.775","km":498.775,"side":"LHS","rem":""},{"sr":170,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"NGS","name":"Inner Distant","mast":"497.675","km":497.675,"side":"LHS","rem":""},{"sr":171,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"NGS","name":"Neutral Section","mast":"497.575","km":497.575,"side":"","rem":"Neutral Section"},{"sr":172,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"NGS","name":"Home","mast":"496.675","km":496.675,"side":"LHS","rem":""},{"sr":173,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"NGS","name":"Starter","mast":"495.775","km":495.775,"side":"LHS","rem":""},{"sr":174,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"NGS","name":"Adv. Starter","mast":"495.225","km":495.225,"side":"LHS","rem":""},{"sr":175,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"AKOR","name":"Distant","mast":"493.375","km":493.375,"side":"LHS","rem":""},{"sr":176,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"AKOR","name":"Inner Distant","mast":"492.325","km":492.325,"side":"LHS","rem":""},{"sr":177,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"AKOR","name":"Home","mast":"491.325","km":491.325,"side":"LHS","rem":""},{"sr":178,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"AKOR","name":"Starter (M/L)","mast":"489.675","km":489.675,"side":"LHS","rem":""},{"sr":179,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"AKOR","name":"Adv. Starter","mast":"489.325","km":489.325,"side":"LHS","rem":""},{"sr":180,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"TLT","name":"Distant","mast":"479.525","km":479.525,"side":"LHS","rem":""},{"sr":181,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"TLT","name":"Inner Distant","mast":"478.575","km":478.575,"side":"LHS","rem":""},{"sr":182,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"TLT","name":"Home","mast":"477.625","km":477.625,"side":"LHS","rem":""},{"sr":183,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"TLT","name":"Starter","mast":"476.075","km":476.075,"side":"LHS","rem":""},{"sr":184,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"TLT","name":"Adv. Starter","mast":"475.625","km":475.625,"side":"LHS","rem":""},{"sr":185,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"HG","name":"Distant","mast":"474.225","km":474.225,"side":"LHS","rem":""},{"sr":186,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"HG","name":"Inner Distant","mast":"473.275","km":473.275,"side":"LHS","rem":""},{"sr":187,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"HG","name":"Home","mast":"472.225","km":472.225,"side":"LHS","rem":""},{"sr":188,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"HG","name":"Routing Home","mast":"471.225","km":471.225,"side":"LHS","rem":""},{"sr":189,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"HG","name":"Starter","mast":"469.975","km":469.975,"side":"LHS","rem":""},{"sr":190,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"HG","name":"Adv. Starter","mast":"469.075","km":469.075,"side":"LHS","rem":""},{"sr":191,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"HG - TKWD","name":"Neutral Section","mast":"467.875","km":467.875,"side":"","rem":"Neutral Section"},{"sr":192,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"TKWD","name":"Distant","mast":"464.675","km":464.675,"side":"LHS","rem":""},{"sr":193,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"TKWD","name":"Inner Distant","mast":"463.675","km":463.675,"side":"LHS","rem":""},{"sr":194,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"TKWD","name":"Home","mast":"462.775","km":462.775,"side":"LHS","rem":""},{"sr":195,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"TKWD","name":"Starter","mast":"461.575","km":461.575,"side":"LHS","rem":""},{"sr":196,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"TKWD","name":"Adv. Starter","mast":"461.275","km":461.275,"side":"LHS","rem":""},{"sr":197,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"SUR","name":"Distant","mast":"458.325","km":458.325,"side":"LHS","rem":""},{"sr":198,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"SUR","name":"Inner Distant","mast":"457.375","km":457.375,"side":"LHS","rem":""},{"sr":199,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"SUR","name":"Home","mast":"456.325","km":456.325,"side":"LHS","rem":""},{"sr":200,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"SUR","name":"Routing","mast":"455.725","km":455.725,"side":"LHS","rem":""},{"sr":201,"sec":"WADI-SUR","cid":"c1","dir":1,"st":"SUR","name":"Starter","mast":"454.35","km":454.35,"side":"LHS","rem":""},{"sr":203,"sec":"SUR-DD","cid":"c3","dir":1,"st":"SUR","name":"Starter (PF-4)","mast":"455","km":455.0,"side":"LHS","rem":""},{"sr":205,"sec":"SUR-DD","cid":"c3","dir":1,"st":"SUR","name":"Adv. Starter","mast":"453.925","km":453.925,"side":"LHS","rem":""},{"sr":208,"sec":"SUR-DD","cid":"c3","dir":1,"st":"BALE","name":"Distant","mast":"451.725","km":451.725,"side":"LHS","rem":""},{"sr":209,"sec":"SUR-DD","cid":"c3","dir":1,"st":"BALE","name":"Inner Distant","mast":"450.675","km":450.675,"side":"LHS","rem":""},{"sr":210,"sec":"SUR-DD","cid":"c3","dir":1,"st":"BALE","name":"Home","mast":"449.875","km":449.875,"side":"LHS","rem":""},{"sr":211,"sec":"SUR-DD","cid":"c3","dir":1,"st":"BALE","name":"Starter","mast":"448.625","km":448.625,"side":"LHS","rem":""},{"sr":212,"sec":"SUR-DD","cid":"c3","dir":1,"st":"BALE","name":"Adv. Starter","mast":"448.175","km":448.175,"side":"LHS","rem":""},{"sr":213,"sec":"SUR-DD","cid":"c3","dir":1,"st":"BALE - PK","name":"Neutral Section","mast":"443.125","km":443.125,"side":"","rem":"Neutral Section"},{"sr":214,"sec":"SUR-DD","cid":"c3","dir":1,"st":"PK","name":"Distant","mast":"441.775","km":441.775,"side":"LHS","rem":""},{"sr":215,"sec":"SUR-DD","cid":"c3","dir":1,"st":"PK","name":"Inner Distant","mast":"440.725","km":440.725,"side":"LHS","rem":""},{"sr":216,"sec":"SUR-DD","cid":"c3","dir":1,"st":"PK","name":"Home","mast":"439.825","km":439.825,"side":"LHS","rem":""},{"sr":218,"sec":"SUR-DD","cid":"c3","dir":1,"st":"PK","name":"Starter","mast":"438.725","km":438.725,"side":"LHS","rem":""},{"sr":219,"sec":"SUR-DD","cid":"c3","dir":1,"st":"PK","name":"Adv. Starter","mast":"437.875","km":437.875,"side":"LHS","rem":""},{"sr":220,"sec":"SUR-DD","cid":"c3","dir":1,"st":"MVE","name":"Distant","mast":"432.575","km":432.575,"side":"LHS","rem":""},{"sr":221,"sec":"SUR-DD","cid":"c3","dir":1,"st":"MVE","name":"Inner Distant","mast":"431.475","km":431.475,"side":"LHS","rem":""},{"sr":222,"sec":"SUR-DD","cid":"c3","dir":1,"st":"MVE","name":"Home","mast":"430.575","km":430.575,"side":"LHS","rem":""},{"sr":223,"sec":"SUR-DD","cid":"c3","dir":1,"st":"MVE","name":"Starter","mast":"429.525","km":429.525,"side":"LHS","rem":""},{"sr":224,"sec":"SUR-DD","cid":"c3","dir":1,"st":"MVE","name":"Adv. Starter","mast":"428.825","km":428.825,"side":"LHS","rem":""},{"sr":225,"sec":"SUR-DD","cid":"c3","dir":1,"st":"MO","name":"Distant","mast":"425.225","km":425.225,"side":"LHS","rem":""},{"sr":226,"sec":"SUR-DD","cid":"c3","dir":1,"st":"MO","name":"Neutral Section","mast":"425.025","km":425.025,"side":"","rem":"Neutral Section"},{"sr":227,"sec":"SUR-DD","cid":"c3","dir":1,"st":"MO","name":"Inner Distant","mast":"424.175","km":424.175,"side":"LHS","rem":""},{"sr":228,"sec":"SUR-DD","cid":"c3","dir":1,"st":"MO","name":"Home","mast":"423.175","km":423.175,"side":"RHS","rem":"Right Hand Signal (S-20)"},{"sr":229,"sec":"SUR-DD","cid":"c3","dir":1,"st":"MO","name":"Starter","mast":"421.725","km":421.725,"side":"RHS","rem":"Right Hand Signal (Main Line STR S-19)"},{"sr":230,"sec":"SUR-DD","cid":"c3","dir":1,"st":"MO","name":"Adv. Starter","mast":"421.225","km":421.225,"side":"LHS","rem":""},{"sr":231,"sec":"SUR-DD","cid":"c3","dir":1,"st":"MKPT","name":"Distant","mast":"415.375","km":415.375,"side":"LHS","rem":""},{"sr":232,"sec":"SUR-DD","cid":"c3","dir":1,"st":"MKPT","name":"Inner Distant","mast":"414.375","km":414.375,"side":"LHS","rem":""},{"sr":233,"sec":"SUR-DD","cid":"c3","dir":1,"st":"MKPT","name":"Home","mast":"413.425","km":413.425,"side":"LHS","rem":""},{"sr":234,"sec":"SUR-DD","cid":"c3","dir":1,"st":"MKPT","name":"Starter","mast":"412.275","km":412.275,"side":"LHS","rem":""},{"sr":235,"sec":"SUR-DD","cid":"c3","dir":1,"st":"MKPT","name":"Adv. Starter","mast":"411.725","km":411.725,"side":"LHS","rem":""},{"sr":236,"sec":"SUR-DD","cid":"c3","dir":1,"st":"AAG","name":"Distant","mast":"408.725","km":408.725,"side":"LHS","rem":""},{"sr":237,"sec":"SUR-DD","cid":"c3","dir":1,"st":"AAG","name":"Inner Distant","mast":"407.725","km":407.725,"side":"LHS","rem":""},{"sr":238,"sec":"SUR-DD","cid":"c3","dir":1,"st":"AAG","name":"Home","mast":"406.775","km":406.775,"side":"LHS","rem":""},{"sr":239,"sec":"SUR-DD","cid":"c3","dir":1,"st":"AAG","name":"Starter","mast":"405.525","km":405.525,"side":"LHS","rem":""},{"sr":240,"sec":"SUR-DD","cid":"c3","dir":1,"st":"AAG","name":"Adv. Starter","mast":"405.125","km":405.125,"side":"LHS","rem":""},{"sr":241,"sec":"SUR-DD","cid":"c3","dir":1,"st":"WKA","name":"Distant","mast":"402.525","km":402.525,"side":"LHS","rem":""},{"sr":242,"sec":"SUR-DD","cid":"c3","dir":1,"st":"WKA","name":"Inner Distant","mast":"401.575","km":401.575,"side":"LHS","rem":""},{"sr":243,"sec":"SUR-DD","cid":"c3","dir":1,"st":"WKA","name":"Home","mast":"400.375","km":400.375,"side":"LHS","rem":""},{"sr":244,"sec":"SUR-DD","cid":"c3","dir":1,"st":"WKA","name":"Starter","mast":"399.225","km":399.225,"side":"LHS","rem":""},{"sr":245,"sec":"SUR-DD","cid":"c3","dir":1,"st":"WKA","name":"Adv. Starter","mast":"398.525","km":398.525,"side":"LHS","rem":""},{"sr":246,"sec":"SUR-DD","cid":"c3","dir":1,"st":"WKA - MA","name":"Neutral Section","mast":"396.125","km":396.125,"side":"","rem":"Neutral Section"},{"sr":247,"sec":"SUR-DD","cid":"c3","dir":1,"st":"MA","name":"Distant","mast":"395.275","km":395.275,"side":"LHS","rem":""},{"sr":248,"sec":"SUR-DD","cid":"c3","dir":1,"st":"MA","name":"Inner Distant","mast":"394.275","km":394.275,"side":"LHS","rem":""},{"sr":249,"sec":"SUR-DD","cid":"c3","dir":1,"st":"MA","name":"Home","mast":"393.275","km":393.275,"side":"LHS","rem":""},{"sr":250,"sec":"SUR-DD","cid":"c3","dir":1,"st":"MA","name":"Starter","mast":"391.975","km":391.975,"side":"LHS","rem":""},{"sr":251,"sec":"SUR-DD","cid":"c3","dir":1,"st":"MA","name":"Adv. Starter","mast":"391.475","km":391.475,"side":"LHS","rem":""},{"sr":252,"sec":"SUR-DD","cid":"c3","dir":1,"st":"Gate","name":"Distant","mast":"389.525","km":389.525,"side":"LHS","rem":""},{"sr":253,"sec":"SUR-DD","cid":"c3","dir":1,"st":"Gate","name":"Inner Distant","mast":"388.525","km":388.525,"side":"LHS","rem":""},{"sr":254,"sec":"SUR-DD","cid":"c3","dir":1,"st":"Gate","name":"Home (Gate)","mast":"387.525","km":387.525,"side":"LHS","rem":""},{"sr":255,"sec":"SUR-DD","cid":"c3","dir":1,"st":"WDS","name":"Inner Distant","mast":"386.575","km":386.575,"side":"LHS","rem":""},{"sr":257,"sec":"SUR-DD","cid":"c3","dir":1,"st":"WDS","name":"Home","mast":"385.625","km":385.625,"side":"LHS","rem":""},{"sr":258,"sec":"SUR-DD","cid":"c3","dir":1,"st":"WDS","name":"Starter","mast":"384.425","km":384.425,"side":"LHS","rem":""},{"sr":259,"sec":"SUR-DD","cid":"c3","dir":1,"st":"WDS","name":"Adv. Starter","mast":"383.725","km":383.725,"side":"LHS","rem":""},{"sr":260,"sec":"SUR-DD","cid":"c3","dir":1,"st":"KWV","name":"Distant","mast":"379.575","km":379.575,"side":"LHS","rem":""},{"sr":261,"sec":"SUR-DD","cid":"c3","dir":1,"st":"KWV","name":"Inner Distant","mast":"378.625","km":378.625,"side":"LHS","rem":""},{"sr":262,"sec":"SUR-DD","cid":"c3","dir":1,"st":"KWV","name":"Home","mast":"377.975","km":377.975,"side":"LHS","rem":""},{"sr":263,"sec":"SUR-DD","cid":"c4","dir":1,"st":"KWV","name":"Starter","mast":"376.275","km":376.275,"side":"LHS","rem":""},{"sr":264,"sec":"SUR-DD","cid":"c4","dir":1,"st":"KWV","name":"Adv. Starter","mast":"375.375","km":375.375,"side":"LHS","rem":""},{"sr":265,"sec":"SUR-DD","cid":"c4","dir":1,"st":"KWV - DHS","name":"Neutral Section","mast":"373.675","km":373.675,"side":"","rem":"Neutral Section"},{"sr":266,"sec":"SUR-DD","cid":"c4","dir":1,"st":"DHS","name":"Distant","mast":"369.575","km":369.575,"side":"LHS","rem":""},{"sr":267,"sec":"SUR-DD","cid":"c4","dir":1,"st":"DHS","name":"Inner Distant","mast":"368.575","km":368.575,"side":"LHS","rem":""},{"sr":268,"sec":"SUR-DD","cid":"c4","dir":1,"st":"DHS","name":"Home","mast":"367.725","km":367.725,"side":"LHS","rem":""},{"sr":269,"sec":"SUR-DD","cid":"c4","dir":1,"st":"DHS","name":"Starter","mast":"366.525","km":366.525,"side":"LHS","rem":""},{"sr":270,"sec":"SUR-DD","cid":"c4","dir":1,"st":"DHS","name":"Adv. Starter","mast":"365.775","km":365.775,"side":"LHS","rem":""},{"sr":271,"sec":"SUR-DD","cid":"c4","dir":1,"st":"KEM","name":"Distant","mast":"361.025","km":361.025,"side":"LHS","rem":""},{"sr":272,"sec":"SUR-DD","cid":"c4","dir":1,"st":"KEM","name":"Inner Distant","mast":"360.025","km":360.025,"side":"LHS","rem":""},{"sr":273,"sec":"SUR-DD","cid":"c4","dir":1,"st":"KEM","name":"Home","mast":"359.025","km":359.025,"side":"LHS","rem":""},{"sr":275,"sec":"SUR-DD","cid":"c4","dir":1,"st":"KEM","name":"Starter","mast":"357.675","km":357.675,"side":"LHS","rem":""},{"sr":276,"sec":"SUR-DD","cid":"c4","dir":1,"st":"KEM","name":"Adv. Starter","mast":"357.075","km":357.075,"side":"LHS","rem":""},{"sr":277,"sec":"SUR-DD","cid":"c4","dir":1,"st":"BLNI","name":"Distant","mast":"352.725","km":352.725,"side":"LHS","rem":""},{"sr":278,"sec":"SUR-DD","cid":"c4","dir":1,"st":"BLNI","name":"Inner Distant","mast":"351.725","km":351.725,"side":"LHS","rem":""},{"sr":279,"sec":"SUR-DD","cid":"c4","dir":1,"st":"BLNI","name":"Home","mast":"350.775","km":350.775,"side":"LHS","rem":""},{"sr":280,"sec":"SUR-DD","cid":"c4","dir":1,"st":"BLNI","name":"Starter","mast":"349.675","km":349.675,"side":"LHS","rem":""},{"sr":281,"sec":"SUR-DD","cid":"c4","dir":1,"st":"BLNI","name":"Adv. Starter","mast":"349.125","km":349.125,"side":"LHS","rem":""},{"sr":282,"sec":"SUR-DD","cid":"c4","dir":1,"st":"BLNI - JH","name":"Neutral Section","mast":"347.175","km":347.175,"side":"","rem":"Neutral Section"},{"sr":284,"sec":"SUR-DD","cid":"c4","dir":1,"st":"JH","name":"Distant","mast":"344.875","km":344.875,"side":"LHS","rem":""},{"sr":285,"sec":"SUR-DD","cid":"c4","dir":1,"st":"JH","name":"Inner Distant","mast":"343.825","km":343.825,"side":"LHS","rem":""},{"sr":286,"sec":"SUR-DD","cid":"c4","dir":1,"st":"JH","name":"Home","mast":"342.775","km":342.775,"side":"LHS","rem":""},{"sr":287,"sec":"SUR-DD","cid":"c4","dir":1,"st":"JH","name":"Starter","mast":"341.475","km":341.475,"side":"LHS","rem":""},{"sr":288,"sec":"SUR-DD","cid":"c4","dir":1,"st":"JH","name":"Adv. Starter","mast":"341.025","km":341.025,"side":"LHS","rem":""},{"sr":290,"sec":"SUR-DD","cid":"c4","dir":1,"st":"PPJ","name":"Distant","mast":"335.675","km":335.675,"side":"LHS","rem":""},{"sr":291,"sec":"SUR-DD","cid":"c4","dir":1,"st":"PPJ","name":"Inner Distant","mast":"334.675","km":334.675,"side":"LHS","rem":""},{"sr":292,"sec":"SUR-DD","cid":"c4","dir":1,"st":"PPJ","name":"Home","mast":"333.775","km":333.775,"side":"LHS","rem":""},{"sr":293,"sec":"SUR-DD","cid":"c4","dir":1,"st":"PPJ","name":"Starter","mast":"332.625","km":332.625,"side":"LHS","rem":""},{"sr":294,"sec":"SUR-DD","cid":"c4","dir":1,"st":"PPJ","name":"Adv. Starter","mast":"332.275","km":332.275,"side":"LHS","rem":""},{"sr":296,"sec":"SUR-DD","cid":"c4","dir":1,"st":"WSB","name":"Distant","mast":"326.275","km":326.275,"side":"LHS","rem":""},{"sr":297,"sec":"SUR-DD","cid":"c4","dir":1,"st":"WSB","name":"Inner Distant","mast":"325.275","km":325.275,"side":"LHS","rem":""},{"sr":298,"sec":"SUR-DD","cid":"c4","dir":1,"st":"WSB","name":"Home","mast":"324.325","km":324.325,"side":"LHS","rem":""},{"sr":299,"sec":"SUR-DD","cid":"c4","dir":1,"st":"WSB","name":"Starter","mast":"323.125","km":323.125,"side":"LHS","rem":""},{"sr":300,"sec":"SUR-DD","cid":"c4","dir":1,"st":"WSB","name":"Adv. Starter","mast":"322.625","km":322.625,"side":"LHS","rem":""},{"sr":301,"sec":"SUR-DD","cid":"c4","dir":1,"st":"PRWD","name":"Distant","mast":"319.175","km":319.175,"side":"LHS","rem":""},{"sr":302,"sec":"SUR-DD","cid":"c4","dir":1,"st":"PRWD","name":"Inner Distant","mast":"318.075","km":318.075,"side":"LHS","rem":""},{"sr":303,"sec":"SUR-DD","cid":"c4","dir":1,"st":"PRWD","name":"Home","mast":"317.025","km":317.025,"side":"LHS","rem":""},{"sr":304,"sec":"SUR-DD","cid":"c4","dir":1,"st":"PRWD","name":"Starter","mast":"315.875","km":315.875,"side":"LHS","rem":""},{"sr":305,"sec":"SUR-DD","cid":"c4","dir":1,"st":"PRWD","name":"Adv. Starter","mast":"315.375","km":315.375,"side":"LHS","rem":""},{"sr":306,"sec":"SUR-DD","cid":"c4","dir":1,"st":"PRWD - JNTR","name":"Neutral Section","mast":"315.175","km":315.175,"side":"","rem":"Neutral Section"},{"sr":307,"sec":"SUR-DD","cid":"c4","dir":1,"st":"JNTR","name":"Distant","mast":"310.125","km":310.125,"side":"LHS","rem":""},{"sr":308,"sec":"SUR-DD","cid":"c4","dir":1,"st":"JNTR","name":"Inner Distant","mast":"309.475","km":309.475,"side":"LHS","rem":""},{"sr":309,"sec":"SUR-DD","cid":"c4","dir":1,"st":"JNTR","name":"Home","mast":"308.075","km":308.075,"side":"LHS","rem":""},{"sr":310,"sec":"SUR-DD","cid":"c4","dir":1,"st":"JNTR","name":"Starter","mast":"306.975","km":306.975,"side":"LHS","rem":""},{"sr":311,"sec":"SUR-DD","cid":"c4","dir":1,"st":"JNTR","name":"Adv. Starter","mast":"306.425","km":306.425,"side":"LHS","rem":""},{"sr":312,"sec":"SUR-DD","cid":"c4","dir":1,"st":"BGVN","name":"Distant","mast":"298.975","km":298.975,"side":"LHS","rem":""},{"sr":313,"sec":"SUR-DD","cid":"c4","dir":1,"st":"BGVN","name":"Inner Distant","mast":"297.625","km":297.625,"side":"LHS","rem":""},{"sr":315,"sec":"SUR-DD","cid":"c4","dir":1,"st":"BGVN","name":"Home","mast":"296.725","km":296.725,"side":"LHS","rem":""},{"sr":316,"sec":"SUR-DD","cid":"c4","dir":1,"st":"BGVN","name":"Starter","mast":"295.825","km":295.825,"side":"LHS","rem":""},{"sr":317,"sec":"SUR-DD","cid":"c4","dir":1,"st":"BGVN","name":"Adv. Starter","mast":"294.225","km":294.225,"side":"LHS","rem":""},{"sr":318,"sec":"SUR-DD","cid":"c4","dir":1,"st":"MLM","name":"Distant","mast":"289.625","km":289.625,"side":"LHS","rem":""},{"sr":319,"sec":"SUR-DD","cid":"c4","dir":1,"st":"MLM","name":"Neutral Section","mast":"289.075","km":289.075,"side":"","rem":"Neutral Section"},{"sr":320,"sec":"SUR-DD","cid":"c4","dir":1,"st":"MLM","name":"Inner Distant","mast":"288.625","km":288.625,"side":"LHS","rem":""},{"sr":321,"sec":"SUR-DD","cid":"c4","dir":1,"st":"MLM","name":"Home","mast":"287.725","km":287.725,"side":"LHS","rem":""},{"sr":322,"sec":"SUR-DD","cid":"c4","dir":1,"st":"MLM","name":"Starter","mast":"286.625","km":286.625,"side":"LHS","rem":""},{"sr":323,"sec":"SUR-DD","cid":"c4","dir":1,"st":"MLM","name":"Adv. Starter","mast":"286.025","km":286.025,"side":"LHS","rem":""},{"sr":324,"sec":"SUR-DD","cid":"c4","dir":1,"st":"BRB","name":"Distant","mast":"280.425","km":280.425,"side":"LHS","rem":""},{"sr":325,"sec":"SUR-DD","cid":"c4","dir":1,"st":"BRB","name":"Inner Distant","mast":"279.475","km":279.475,"side":"LHS","rem":""},{"sr":326,"sec":"SUR-DD","cid":"c4","dir":1,"st":"BRB","name":"Home","mast":"278.525","km":278.525,"side":"LHS","rem":""},{"sr":327,"sec":"SUR-DD","cid":"c4","dir":1,"st":"BRB","name":"Starter","mast":"277.475","km":277.475,"side":"LHS","rem":""},{"sr":328,"sec":"SUR-DD","cid":"c4","dir":1,"st":"BRB","name":"Adv. Starter","mast":"276.775","km":276.775,"side":"LHS","rem":""},{"sr":329,"sec":"SUR-DD","cid":"c4","dir":1,"st":"Gate","name":"Distant","mast":"273.525","km":273.525,"side":"LHS","rem":""},{"sr":330,"sec":"SUR-DD","cid":"c4","dir":1,"st":"Gate","name":"Inner Distant","mast":"272.475","km":272.475,"side":"LHS","rem":""},{"sr":331,"sec":"SUR-DD","cid":"c4","dir":1,"st":"Gate","name":"Home (Gate)","mast":"271.575","km":271.575,"side":"LHS","rem":""},{"sr":332,"sec":"SUR-DD","cid":"c4","dir":1,"st":"Gate - DD","name":"Neutral Section","mast":"270.625","km":270.625,"side":"","rem":"Neutral Section"},{"sr":333,"sec":"SUR-DD","cid":"c4","dir":1,"st":"DD","name":"Distant","mast":"270.375","km":270.375,"side":"LHS","rem":""},{"sr":334,"sec":"SUR-DD","cid":"c4","dir":1,"st":"DD","name":"Inner Distant","mast":"269.275","km":269.275,"side":"LHS","rem":""},{"sr":335,"sec":"SUR-DD","cid":"c4","dir":1,"st":"DD","name":"Home","mast":"268.375","km":268.375,"side":"LHS","rem":""},{"sr":336,"sec":"SUR-DD","cid":"c4","dir":1,"st":"DD","name":"Inner Home","mast":"268.025","km":268.025,"side":"RHS","rem":""},{"sr":338,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"DD","name":"Starter","mast":"267.7","km":267.7,"side":"LHS","rem":""},{"sr":339,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"DD","name":"Adv. Starter","mast":"268.35","km":268.35,"side":"LHS","rem":""},{"sr":341,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"Gate","name":"Distant","mast":"269.1","km":269.1,"side":"LHS","rem":""},{"sr":342,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"Gate","name":"Inner Distant","mast":"270.15","km":270.15,"side":"LHS","rem":""},{"sr":343,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"Gate","name":"Neutral Section","mast":"270.65","km":270.65,"side":"","rem":"Neutral Section"},{"sr":344,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"Gate","name":"G/Home","mast":"271.15","km":271.15,"side":"LHS","rem":""},{"sr":345,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"BRB","name":"Distant","mast":"274.65","km":274.65,"side":"LHS","rem":""},{"sr":346,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"BRB","name":"Inner Distant","mast":"275.75","km":275.75,"side":"LHS","rem":""},{"sr":347,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"BRB","name":"Home","mast":"276.75","km":276.75,"side":"LHS","rem":""},{"sr":348,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"BRB","name":"Starter","mast":"278","km":278.0,"side":"LHS","rem":""},{"sr":349,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"BRB","name":"Adv. Starter","mast":"278.45","km":278.45,"side":"LHS","rem":""},{"sr":350,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"MLM","name":"Distant","mast":"283.8","km":283.8,"side":"LHS","rem":""},{"sr":351,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"MLM","name":"Inner Distant","mast":"284.85","km":284.85,"side":"LHS","rem":""},{"sr":352,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"MLM","name":"Home","mast":"286","km":286.0,"side":"LHS","rem":""},{"sr":353,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"MLM","name":"Starter","mast":"287.25","km":287.25,"side":"LHS","rem":""},{"sr":354,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"MLM","name":"Adv. Starter","mast":"287.65","km":287.65,"side":"LHS","rem":""},{"sr":355,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"MLM - BGVN","name":"Neutral Section","mast":"289.1","km":289.1,"side":"","rem":"Neutral Section"},{"sr":356,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"BGVN","name":"Distant","mast":"292.1","km":292.1,"side":"LHS","rem":""},{"sr":357,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"BGVN","name":"Inner Distant","mast":"293.15","km":293.15,"side":"LHS","rem":""},{"sr":358,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"BGVN","name":"Home","mast":"294.2","km":294.2,"side":"LHS","rem":""},{"sr":359,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"BGVN","name":"Starter","mast":"296.15","km":296.15,"side":"LHS","rem":""},{"sr":361,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"BGVN","name":"Adv. Starter","mast":"296.7","km":296.7,"side":"LHS","rem":""},{"sr":362,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"JNTR","name":"Distant","mast":"304.35","km":304.35,"side":"LHS","rem":""},{"sr":363,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"JNTR","name":"Inner Distant","mast":"305.4","km":305.4,"side":"LHS","rem":""},{"sr":364,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"JNTR","name":"Home","mast":"306.4","km":306.4,"side":"LHS","rem":""},{"sr":365,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"JNTR","name":"Starter","mast":"307.55","km":307.55,"side":"LHS","rem":""},{"sr":366,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"JNTR","name":"Adv. Starter","mast":"308.05","km":308.05,"side":"LHS","rem":""},{"sr":367,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"PRWD","name":"Distant","mast":"312.7","km":312.7,"side":"LHS","rem":""},{"sr":368,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"PRWD","name":"Inner Distant","mast":"313.75","km":313.75,"side":"LHS","rem":""},{"sr":369,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"PRWD","name":"Home","mast":"314.8","km":314.8,"side":"LHS","rem":""},{"sr":370,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"PRWD","name":"Neutral Section","mast":"315.2","km":315.2,"side":"","rem":"Neutral Section"},{"sr":371,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"PRWD","name":"Starter","mast":"316.55","km":316.55,"side":"LHS","rem":""},{"sr":372,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"PRWD","name":"Adv. Starter","mast":"317.05","km":317.05,"side":"LHS","rem":""},{"sr":373,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"WSB","name":"Distant","mast":"320.6","km":320.6,"side":"LHS","rem":""},{"sr":374,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"WSB","name":"Inner Distant","mast":"321.5","km":321.5,"side":"LHS","rem":""},{"sr":375,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"WSB","name":"Home","mast":"322.55","km":322.55,"side":"LHS","rem":""},{"sr":376,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"WSB","name":"Starter","mast":"323.75","km":323.75,"side":"LHS","rem":""},{"sr":377,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"WSB","name":"Adv. Starter","mast":"324.25","km":324.25,"side":"LHS","rem":""},{"sr":379,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"PPJ","name":"Distant","mast":"330.25","km":330.25,"side":"LHS","rem":""},{"sr":380,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"PPJ","name":"Inner Distant","mast":"331.2","km":331.2,"side":"LHS","rem":""},{"sr":381,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"PPJ","name":"Home","mast":"332.25","km":332.25,"side":"LHS","rem":""},{"sr":382,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"PPJ","name":"Starter","mast":"333.3","km":333.3,"side":"LHS","rem":""},{"sr":383,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"PPJ","name":"Adv. Starter","mast":"333.75","km":333.75,"side":"LHS","rem":""},{"sr":385,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"JEUR","name":"Distant","mast":"338.85","km":338.85,"side":"LHS","rem":""},{"sr":386,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"JEUR","name":"Inner Distant","mast":"339.85","km":339.85,"side":"LHS","rem":""},{"sr":387,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"JEUR","name":"Home","mast":"340.8","km":340.8,"side":"LHS","rem":""},{"sr":388,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"JEUR","name":"Starter","mast":"342.4","km":342.4,"side":"LHS","rem":""},{"sr":389,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"JEUR","name":"Adv. Starter","mast":"342.8","km":342.8,"side":"LHS","rem":""},{"sr":391,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"BLNI","name":"Distant","mast":"346.7","km":346.7,"side":"LHS","rem":""},{"sr":392,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"BLNI","name":"Neutral Section","mast":"347.2","km":347.2,"side":"","rem":"Neutral Section"},{"sr":393,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"BLNI","name":"Inner Distant","mast":"347.7","km":347.7,"side":"LHS","rem":""},{"sr":395,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"BLNI","name":"Home","mast":"348.75","km":348.75,"side":"LHS","rem":""},{"sr":396,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"BLNI","name":"Starter","mast":"350.3","km":350.3,"side":"LHS","rem":""},{"sr":397,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"BLNI","name":"Adv. Starter","mast":"350.7","km":350.7,"side":"LHS","rem":""},{"sr":398,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"KEM","name":"Distant","mast":"354.75","km":354.75,"side":"LHS","rem":""},{"sr":399,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"KEM","name":"Inner Distant","mast":"356.05","km":356.05,"side":"LHS","rem":""},{"sr":400,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"KEM","name":"Home","mast":"357.05","km":357.05,"side":"LHS","rem":""},{"sr":401,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"KEM","name":"Starter","mast":"358.35","km":358.35,"side":"LHS","rem":""},{"sr":402,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"KEM","name":"Adv. Starter","mast":"358.85","km":358.85,"side":"LHS","rem":""},{"sr":404,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"DHS","name":"Distant","mast":"363.55","km":363.55,"side":"LHS","rem":""},{"sr":405,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"DHS","name":"Inner Distant","mast":"364.6","km":364.6,"side":"LHS","rem":""},{"sr":406,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"DHS","name":"Home","mast":"365.7","km":365.7,"side":"LHS","rem":""},{"sr":407,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"DHS","name":"Starter","mast":"367.05","km":367.05,"side":"LHS","rem":""},{"sr":408,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"DHS","name":"Adv. Starter","mast":"367.65","km":367.65,"side":"LHS","rem":""},{"sr":409,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"KWV","name":"Distant","mast":"373.25","km":373.25,"side":"LHS","rem":""},{"sr":410,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"KWV","name":"Neutral Section","mast":"373.7","km":373.7,"side":"","rem":"Neutral Section"},{"sr":411,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"KWV","name":"Inner Distant","mast":"374.25","km":374.25,"side":"LHS","rem":""},{"sr":412,"sec":"DD-SUR","cid":"c4","dir":-1,"st":"KWV","name":"Home","mast":"375.3","km":375.3,"side":"LHS","rem":""},{"sr":413,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"KWV","name":"Starter","mast":"376.9","km":376.9,"side":"LHS","rem":""},{"sr":414,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"KWV","name":"Adv. Starter","mast":"377.9","km":377.9,"side":"LHS","rem":""},{"sr":415,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"WDS","name":"Distant","mast":"381.4","km":381.4,"side":"LHS","rem":""},{"sr":416,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"WDS","name":"Inner Distant","mast":"382.5","km":382.5,"side":"LHS","rem":""},{"sr":417,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"WDS","name":"Home","mast":"383.65","km":383.65,"side":"LHS","rem":""},{"sr":418,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"WDS","name":"Starter","mast":"385.05","km":385.05,"side":"LHS","rem":""},{"sr":419,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"WDS","name":"Adv. Starter","mast":"385.55","km":385.55,"side":"LHS","rem":""},{"sr":421,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"Gate","name":"Inner Distant","mast":"386.2","km":386.2,"side":"LHS","rem":""},{"sr":422,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"Gate","name":"Home (Gate)","mast":"387.15","km":387.15,"side":"LHS","rem":""},{"sr":423,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"MA","name":"Distant","mast":"389.35","km":389.35,"side":"LHS","rem":""},{"sr":424,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"MA","name":"Inner Distant","mast":"390.4","km":390.4,"side":"LHS","rem":""},{"sr":425,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"MA","name":"Home","mast":"391.4","km":391.4,"side":"LHS","rem":""},{"sr":426,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"MA","name":"Starter","mast":"392.75","km":392.75,"side":"LHS","rem":""},{"sr":427,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"MA","name":"Adv. Starter","mast":"393.1","km":393.1,"side":"LHS","rem":""},{"sr":428,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"MA - WKA","name":"Neutral Section","mast":"396.15","km":396.15,"side":"","rem":"Neutral Section"},{"sr":429,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"WKA","name":"Distant","mast":"396.35","km":396.35,"side":"LHS","rem":""},{"sr":430,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"WKA","name":"Inner Distant","mast":"397.4","km":397.4,"side":"LHS","rem":""},{"sr":431,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"WKA","name":"Home","mast":"398.45","km":398.45,"side":"LHS","rem":""},{"sr":432,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"WKA","name":"Starter","mast":"399.75","km":399.75,"side":"LHS","rem":""},{"sr":433,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"WKA","name":"Adv. Starter","mast":"400.3","km":400.3,"side":"LHS","rem":""},{"sr":434,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"AAG","name":"Distant","mast":"402.8","km":402.8,"side":"LHS","rem":""},{"sr":435,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"AAG","name":"Inner Distant","mast":"404.05","km":404.05,"side":"LHS","rem":""},{"sr":436,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"AAG","name":"Home","mast":"405.05","km":405.05,"side":"LHS","rem":""},{"sr":437,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"AAG","name":"Starter","mast":"406.2","km":406.2,"side":"LHS","rem":""},{"sr":438,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"AAG","name":"Adv. Starter","mast":"406.7","km":406.7,"side":"LHS","rem":""},{"sr":439,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"MKPT","name":"Distant","mast":"409.55","km":409.55,"side":"LHS","rem":""},{"sr":440,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"MKPT","name":"Inner Distant","mast":"410.6","km":410.6,"side":"LHS","rem":""},{"sr":441,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"MKPT","name":"Home","mast":"411.65","km":411.65,"side":"LHS","rem":""},{"sr":442,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"MKPT","name":"Starter","mast":"412.9","km":412.9,"side":"LHS","rem":""},{"sr":443,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"MKPT","name":"Adv. Starter","mast":"413.35","km":413.35,"side":"LHS","rem":""},{"sr":444,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"MO","name":"Distant","mast":"419.15","km":419.15,"side":"LHS","rem":""},{"sr":445,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"MO","name":"Inner Distant","mast":"420.15","km":420.15,"side":"LHS","rem":""},{"sr":446,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"MO","name":"Home","mast":"421.15","km":421.15,"side":"LHS","rem":""},{"sr":447,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"MO","name":"Starter","mast":"422.55","km":422.55,"side":"LHS","rem":""},{"sr":448,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"MO","name":"Adv. Starter","mast":"423.15","km":423.15,"side":"LHS","rem":""},{"sr":449,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"MO - MVE","name":"Neutral Section","mast":"425.05","km":425.05,"side":"","rem":"Neutral Section"},{"sr":450,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"MVE","name":"Distant","mast":"426.7","km":426.7,"side":"LHS","rem":""},{"sr":451,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"MVE","name":"Inner Distant","mast":"427.8","km":427.8,"side":"LHS","rem":""},{"sr":452,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"MVE","name":"Home","mast":"428.8","km":428.8,"side":"LHS","rem":""},{"sr":453,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"MVE","name":"Starter","mast":"430.05","km":430.05,"side":"RHS","rem":"Right Hand Signal (Main Line STR S-3)"},{"sr":454,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"MVE","name":"Adv. Starter","mast":"430.55","km":430.55,"side":"LHS","rem":""},{"sr":455,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"PK","name":"Distant","mast":"435.6","km":435.6,"side":"LHS","rem":""},{"sr":457,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"PK","name":"Inner Distant","mast":"436.65","km":436.65,"side":"LHS","rem":""},{"sr":458,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"PK","name":"Home","mast":"437.7","km":437.7,"side":"LHS","rem":""},{"sr":459,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"PK","name":"Starter","mast":"439.35","km":439.35,"side":"LHS","rem":""},{"sr":460,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"PK","name":"Adv. Starter","mast":"439.75","km":439.75,"side":"LHS","rem":""},{"sr":462,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"PK - BALE","name":"Neutral Section","mast":"445.15","km":445.15,"side":"","rem":"Neutral Section"},{"sr":463,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"BALE","name":"Distant","mast":"445.85","km":445.85,"side":"LHS","rem":""},{"sr":464,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"BALE","name":"Inner Distant","mast":"447.05","km":447.05,"side":"LHS","rem":""},{"sr":465,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"BALE","name":"Home","mast":"448.15","km":448.15,"side":"LHS","rem":""},{"sr":466,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"BALE","name":"Starter","mast":"449.3","km":449.3,"side":"LHS","rem":""},{"sr":467,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"BALE","name":"Adv. Starter","mast":"449.8","km":449.8,"side":"LHS","rem":""},{"sr":468,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"SUR","name":"Distant","mast":"451.65","km":451.65,"side":"LHS","rem":""},{"sr":469,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"SUR","name":"Inner Distant","mast":"452.7","km":452.7,"side":"LHS","rem":""},{"sr":470,"sec":"DD-SUR","cid":"c3","dir":-1,"st":"SUR","name":"Home","mast":"453.95","km":453.95,"side":"LHS","rem":""},{"sr":621,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"KWV","name":"Starter PF-1 (S-36)","mast":"376.6","km":376.6,"side":"RHS","rem":"Right Hand Signal"},{"sr":622,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"KWV","name":"Adv. Starter","mast":"375.85","km":375.85,"side":"LHS","rem":""},{"sr":624,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"KWV - MLB","name":"Neutral Section","mast":"383.65","km":383.65,"side":"","rem":"Neutral Section"},{"sr":625,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"MLB (R)","name":"Distant","mast":"396.25","km":396.25,"side":"LHS","rem":""},{"sr":626,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"MLB (R)","name":"Home","mast":"397.25","km":397.25,"side":"LHS","rem":""},{"sr":627,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"MLB (R)","name":"Starter","mast":"398.35","km":398.35,"side":"LHS","rem":""},{"sr":628,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"MLB (R)","name":"Adv. Starter","mast":"398.7","km":398.7,"side":"LHS","rem":""},{"sr":630,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"Gate","name":"Gate Distant","mast":"423.55","km":423.55,"side":"LHS","rem":""},{"sr":631,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"Gate","name":"Gate Signal","mast":"424.45","km":424.45,"side":"LHS","rem":"Gate No. 22"},{"sr":635,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"SGRE (L)","name":"Distant","mast":"427","km":427.0,"side":"LHS","rem":""},{"sr":636,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"SGRE (L)","name":"Home","mast":"427.95","km":427.95,"side":"LHS","rem":""},{"sr":637,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"SGRE (L)","name":"Starter","mast":"429.4","km":429.4,"side":"LHS","rem":""},{"sr":638,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"SGRE (L)","name":"Adv. Starter","mast":"429.8","km":429.8,"side":"LHS","rem":""},{"sr":641,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"Gate","name":"Gate Distant","mast":"430.65","km":430.65,"side":"LHS","rem":""},{"sr":642,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"Gate","name":"Gate Signal","mast":"431.45","km":431.45,"side":"LHS","rem":""},{"sr":643,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"SGRE - SGLA","name":"Neutral Section","mast":"439.5","km":439.5,"side":"","rem":"Neutral Section"},{"sr":644,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"SGRE - SGLA","name":"Neutral Section","mast":"456.2","km":456.2,"side":"","rem":"Neutral Section"},{"sr":645,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"SGLA (L)","name":"Distant","mast":"455.8","km":455.8,"side":"LHS","rem":""},{"sr":646,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"SGLA (L)","name":"Home","mast":"457.05","km":457.05,"side":"LHS","rem":""},{"sr":647,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"SGLA (L)","name":"Starter","mast":"458.55","km":458.55,"side":"LHS","rem":""},{"sr":648,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"SGLA (L)","name":"Adv. Starter","mast":"458.9","km":458.9,"side":"LHS","rem":""},{"sr":652,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"JTRD (L)","name":"Distant","mast":"483.65","km":483.65,"side":"LHS","rem":""},{"sr":653,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"JTRD (L)","name":"Home","mast":"484.55","km":484.55,"side":"LHS","rem":""},{"sr":654,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"JTRD (L)","name":"Starter","mast":"486.15","km":486.15,"side":"LHS","rem":""},{"sr":655,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"JTRD (L)","name":"Adv. Starter","mast":"486.5","km":486.5,"side":"LHS","rem":""},{"sr":658,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"DLGN (L)","name":"Distant","mast":"501.1","km":501.1,"side":"LHS","rem":""},{"sr":659,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"DLGN (L)","name":"Home","mast":"502.15","km":502.15,"side":"LHS","rem":""},{"sr":660,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"DLGN (L)","name":"Starter","mast":"503.45","km":503.45,"side":"LHS","rem":""},{"sr":661,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"DLGN (L)","name":"Adv. Starter","mast":"503.9","km":503.9,"side":"LHS","rem":""},{"sr":663,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"DLGN - KVK","name":"Neutral Section","mast":"507.45","km":507.45,"side":"","rem":"Neutral Section"},{"sr":666,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"KVK (L)","name":"Distant","mast":"517.3","km":517.3,"side":"LHS","rem":""},{"sr":667,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"KVK (L)","name":"Home","mast":"518.45","km":518.45,"side":"LHS","rem":""},{"sr":668,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"KVK (L)","name":"Starter","mast":"519.85","km":519.85,"side":"LHS","rem":""},{"sr":669,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"KVK (L)","name":"Adv. Starter","mast":"520.2","km":520.2,"side":"LHS","rem":""},{"sr":673,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"KVK - PVR","name":"Neutral Section","mast":"528.65","km":528.65,"side":"","rem":"Neutral Section"},{"sr":674,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"PVR (L)","name":"Distant","mast":"529.3","km":529.3,"side":"LHS","rem":""},{"sr":675,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"PVR (L)","name":"Home","mast":"530.3","km":530.3,"side":"LHS","rem":""},{"sr":676,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"PVR (L)","name":"Starter","mast":"531.65","km":531.65,"side":"LHS","rem":""},{"sr":677,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"PVR (L)","name":"Adv. Starter","mast":"532.1","km":532.1,"side":"LHS","rem":""},{"sr":680,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"ARAG (L)","name":"Distant","mast":"546.1","km":546.1,"side":"LHS","rem":""},{"sr":681,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"ARAG (L)","name":"Home","mast":"547.15","km":547.15,"side":"LHS","rem":""},{"sr":682,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"ARAG (L)","name":"Starter","mast":"548.35","km":548.35,"side":"LHS","rem":""},{"sr":683,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"ARAG (L)","name":"Adv. Starter","mast":"548.85","km":548.85,"side":"LHS","rem":""},{"sr":686,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"Gate No. 70","name":"Distant","mast":"560.35","km":560.35,"side":"LHS","rem":""},{"sr":687,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"Gate No. 70","name":"Gate Signal","mast":"561.35","km":561.35,"side":"LHS","rem":""},{"sr":688,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"Gate - MRJ","name":"Neutral Section","mast":"562.35","km":562.35,"side":"","rem":"Neutral Section"},{"sr":690,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"MRJ (R)","name":"Distant","mast":"562.5","km":562.5,"side":"LHS","rem":""},{"sr":691,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"MRJ (R)","name":"Home","mast":"563.3","km":563.3,"side":"LHS","rem":""},{"sr":692,"sec":"KWV-MRJ","cid":"c5","dir":-1,"st":"MRJ (R)","name":"Routing R","mast":"279.4","km":564.0,"side":"RHS","rem":"Right Hand Signal (S-48)"},{"sr":715,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"MRJ - ARAG","name":"Neutral section","mast":"562.45","km":562.45,"side":"","rem":"Neutral Section"},{"sr":717,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"Gate","name":"Distant","mast":"562.8","km":562.8,"side":"LHS","rem":""},{"sr":718,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"Gate","name":"Gate Signal","mast":"562.75","km":562.75,"side":"LHS","rem":""},{"sr":720,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"ARAG (R)","name":"Distant","mast":"550.1","km":550.1,"side":"LHS","rem":""},{"sr":721,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"ARAG (R)","name":"Home","mast":"549.05","km":549.05,"side":"LHS","rem":""},{"sr":722,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"ARAG (R)","name":"Starter","mast":"547.9","km":547.9,"side":"LHS","rem":""},{"sr":723,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"ARAG (R)","name":"Adv. Starter","mast":"547.45","km":547.45,"side":"LHS","rem":""},{"sr":726,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"PVR (R)","name":"Distant","mast":"533.5","km":533.5,"side":"LHS","rem":""},{"sr":727,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"PVR (R)","name":"Home","mast":"532.35","km":532.35,"side":"LHS","rem":""},{"sr":728,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"PVR (R)","name":"Starter","mast":"531.1","km":531.1,"side":"LHS","rem":""},{"sr":729,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"PVR (R)","name":"Adv. Starter","mast":"530.55","km":530.55,"side":"LHS","rem":""},{"sr":730,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"PVR - KVK","name":"Neutral section","mast":"528.75","km":528.75,"side":"","rem":"Neutral Section"},{"sr":733,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"KVK (R)","name":"Distant","mast":"521.45","km":521.45,"side":"LHS","rem":""},{"sr":734,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"KVK (R)","name":"Home","mast":"520.45","km":520.45,"side":"LHS","rem":""},{"sr":735,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"KVK (R)","name":"Starter","mast":"519.25","km":519.25,"side":"LHS","rem":""},{"sr":736,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"KVK (R)","name":"Adv. Starter","mast":"518.8","km":518.8,"side":"LHS","rem":""},{"sr":739,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"KVK - DLGN","name":"Neutral section","mast":"507.6","km":507.6,"side":"","rem":"Neutral Section"},{"sr":741,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"DLGN (R)","name":"Distant","mast":"505.15","km":505.15,"side":"LHS","rem":""},{"sr":742,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"DLGN (R)","name":"Home","mast":"504.1","km":504.1,"side":"LHS","rem":""},{"sr":743,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"DLGN (R)","name":"Starter","mast":"502.7","km":502.7,"side":"LHS","rem":""},{"sr":744,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"DLGN (R)","name":"Adv. Starter","mast":"502.35","km":502.35,"side":"LHS","rem":""},{"sr":747,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"JTRD (R)","name":"Distant","mast":"487.65","km":487.65,"side":"LHS","rem":""},{"sr":748,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"JTRD (R)","name":"Home","mast":"486.7","km":486.7,"side":"LHS","rem":""},{"sr":749,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"JTRD (R)","name":"Starter","mast":"485.35","km":485.35,"side":"LHS","rem":""},{"sr":750,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"JTRD (R)","name":"Adv. Starter","mast":"484.75","km":484.75,"side":"LHS","rem":""},{"sr":754,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"SGLA (R)","name":"Distant","mast":"460.25","km":460.25,"side":"LHS","rem":""},{"sr":755,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"SGLA (R)","name":"Home","mast":"459.15","km":459.15,"side":"LHS","rem":""},{"sr":756,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"SGLA (R)","name":"Starter","mast":"457.7","km":457.7,"side":"LHS","rem":""},{"sr":757,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"SGLA (R)","name":"Adv. Starter","mast":"457.3","km":457.3,"side":"LHS","rem":""},{"sr":758,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"SGLA - SGRE","name":"Neutral section","mast":"456.3","km":456.3,"side":"","rem":"Neutral Section"},{"sr":759,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"SGLA - SGRE","name":"Neutral section","mast":"439.6","km":439.6,"side":"","rem":"Neutral Section"},{"sr":760,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"Gate","name":"Distant","mast":"433.05","km":433.05,"side":"LHS","rem":""},{"sr":761,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"Gate","name":"Gate Signal","mast":"431.8","km":431.8,"side":"LHS","rem":""},{"sr":764,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"SGRE (R)","name":"Distant","mast":"431.1","km":431.1,"side":"LHS","rem":""},{"sr":765,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"SGRE (R)","name":"Home","mast":"430","km":430.0,"side":"LHS","rem":""},{"sr":766,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"SGRE (R)","name":"Starter","mast":"428.8","km":428.8,"side":"LHS","rem":""},{"sr":767,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"SGRE (R)","name":"Adv. Starter","mast":"428.25","km":428.25,"side":"RHS","rem":"Right Hand Signal (S-22)"},{"sr":770,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"Gate","name":"Distant","mast":"426.25","km":426.25,"side":"LHS","rem":""},{"sr":771,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"Gate","name":"Gate Signal","mast":"425.05","km":425.05,"side":"LHS","rem":""},{"sr":774,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"MLB (L)","name":"Distant","mast":"399.9","km":399.9,"side":"LHS","rem":""},{"sr":775,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"MLB (L)","name":"Home","mast":"398.9","km":398.9,"side":"LHS","rem":""},{"sr":776,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"MLB (L)","name":"Starter","mast":"397.7","km":397.7,"side":"LHS","rem":""},{"sr":777,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"MLB (L)","name":"Adv. Starter","mast":"397.45","km":397.45,"side":"LHS","rem":""},{"sr":778,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"MLB - KWV","name":"Neutral section","mast":"383.75","km":383.75,"side":"","rem":"Neutral Section"},{"sr":780,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"KWV","name":"Distant","mast":"378.7","km":378.7,"side":"LHS","rem":""},{"sr":781,"sec":"MRJ-KWV","cid":"c5","dir":1,"st":"KWV","name":"Home","mast":"377.25","km":377.25,"side":"LHS","rem":""},{"sr":782,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"KWV","name":"Starter","mast":"377.8","km":377.8,"side":"LHS","rem":""},{"sr":783,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"KWV","name":"Adv. Starter","mast":"KWV1130","km":378.1,"side":"LHS","rem":""},{"sr":785,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"KWV - SEI","name":"SEENA BRIDGE","mast":"389.5","km":389.5,"side":"","rem":"Bridge"},{"sr":786,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"KWV - SEI","name":"Neutral section","mast":"390.3","km":390.3,"side":"","rem":"Neutral Section"},{"sr":787,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"SEI (L)","name":"Distant","mast":"394.2","km":394.2,"side":"LHS","rem":""},{"sr":788,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"SEI (L)","name":"Home","mast":"395.25","km":395.25,"side":"LHS","rem":""},{"sr":789,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"SEI (L)","name":"Starter","mast":"396.45","km":396.45,"side":"LHS","rem":""},{"sr":790,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"SEI (L)","name":"Adv. Starter","mast":"396.85","km":396.85,"side":"LHS","rem":""},{"sr":791,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"Gate","name":"Distant","mast":"407.15","km":407.15,"side":"LHS","rem":""},{"sr":792,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"Gate","name":"Gate Signal","mast":"408.15","km":408.15,"side":"LHS","rem":""},{"sr":794,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"Gate - BTW","name":"Neutral section","mast":"411.25","km":411.25,"side":"","rem":"Neutral Section"},{"sr":795,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"BTW (L)","name":"Distant","mast":"411.5","km":411.5,"side":"LHS","rem":""},{"sr":796,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"BTW (L)","name":"Home","mast":"412.55","km":412.55,"side":"LHS","rem":""},{"sr":798,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"BTW (L)","name":"Starter","mast":"413.95","km":413.95,"side":"LHS","rem":""},{"sr":799,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"BTW (L)","name":"Adv. Starter","mast":"414.45","km":414.45,"side":"LHS","rem":""},{"sr":801,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"PJR (L)","name":"Distant","mast":"429.5","km":429.5,"side":"LHS","rem":""},{"sr":802,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"PJR (L)","name":"Home","mast":"430.5","km":430.5,"side":"LHS","rem":""},{"sr":803,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"PJR (L)","name":"Starter","mast":"432.1","km":432.1,"side":"LHS","rem":""},{"sr":804,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"PJR (L)","name":"Adv. Starter","mast":"432.45","km":432.45,"side":"LHS","rem":""},{"sr":807,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"PJR - DRSV","name":"Neutral section","mast":"442.5","km":442.5,"side":"","rem":"Neutral Section"},{"sr":809,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"DRSV (R)","name":"Distant","mast":"448.65","km":448.65,"side":"LHS","rem":""},{"sr":810,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"DRSV (R)","name":"Home","mast":"449.35","km":449.35,"side":"LHS","rem":""},{"sr":812,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"DRSV (R)","name":"Starter","mast":"450.85","km":450.85,"side":"LHS","rem":""},{"sr":814,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"DRSV (R)","name":"Adv. Starter","mast":"451.2","km":451.2,"side":"LHS","rem":""},{"sr":815,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"YSI (L)","name":"Distant","mast":"458.3","km":458.3,"side":"LHS","rem":""},{"sr":816,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"YSI (L)","name":"Home","mast":"459.3","km":459.3,"side":"LHS","rem":""},{"sr":817,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"YSI (L)","name":"Starter","mast":"460.8","km":460.8,"side":"LHS","rem":""},{"sr":818,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"YSI (L)","name":"Adv. Starter","mast":"461.05","km":461.05,"side":"LHS","rem":""},{"sr":822,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"YSI - DKY","name":"Neutral section","mast":"471.95","km":471.95,"side":"","rem":"Neutral Section"},{"sr":823,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"Gate","name":"Distant","mast":"472.15","km":472.15,"side":"LHS","rem":""},{"sr":824,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"Gate","name":"Gate Signal","mast":"473.2","km":473.2,"side":"LHS","rem":""},{"sr":825,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"DKY (L)","name":"Distant","mast":"474.75","km":474.75,"side":"LHS","rem":""},{"sr":826,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"DKY (L)","name":"Home","mast":"475.85","km":475.85,"side":"LHS","rem":""},{"sr":827,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"DKY (L)","name":"Starter","mast":"477","km":477.0,"side":"LHS","rem":""},{"sr":828,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"DKY (L)","name":"Adv. Starter","mast":"477.5","km":477.5,"side":"LHS","rem":""},{"sr":830,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"Gate","name":"Distant","mast":"483.55","km":483.55,"side":"LHS","rem":""},{"sr":831,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"Gate","name":"Gate Signal","mast":"484.55","km":484.55,"side":"LHS","rem":""},{"sr":832,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"MRX","name":"Station / Halt","mast":"493.35","km":493.35,"side":"","rem":""},{"sr":833,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"MRX - OSA","name":"Neutral section","mast":"494.6","km":494.6,"side":"","rem":"Neutral Section"},{"sr":835,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"Gate","name":"Distant","mast":"499.15","km":499.15,"side":"LHS","rem":""},{"sr":836,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"Gate","name":"Gate Signal","mast":"500.15","km":500.15,"side":"LHS","rem":""},{"sr":840,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"OSA (R)","name":"Distant","mast":"508.55","km":508.55,"side":"LHS","rem":""},{"sr":842,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"OSA (R)","name":"Home","mast":"509.9","km":509.9,"side":"LHS","rem":""},{"sr":843,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"OSA (R)","name":"Starter","mast":"510.95","km":510.95,"side":"LHS","rem":""},{"sr":844,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"OSA (R)","name":"Adv. Starter","mast":"511.2","km":511.2,"side":"LHS","rem":""},{"sr":845,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"OSA - HGL","name":"Neutral section","mast":"511.85","km":511.85,"side":"","rem":"Neutral Section"},{"sr":847,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"HGL (L)","name":"Distant","mast":"517.9","km":517.9,"side":"LHS","rem":""},{"sr":848,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"Gate (LC-55)","name":"Gate Signal LC-55 cum HGL Distant","mast":"519","km":519.0,"side":"LHS","rem":""},{"sr":849,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"HGL (L)","name":"Home","mast":"519.7","km":519.7,"side":"LHS","rem":""},{"sr":850,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"HGL (L)","name":"Starter","mast":"521.2","km":521.2,"side":"LHS","rem":""},{"sr":851,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"HGL (L)","name":"Adv. Starter","mast":"521.65","km":521.65,"side":"LHS","rem":""},{"sr":852,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"Gate","name":"Distant","mast":"524.05","km":524.05,"side":"LHS","rem":""},{"sr":853,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"Gate","name":"Gate Signal","mast":"525.05","km":525.05,"side":"LHS","rem":""},{"sr":854,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"LUR (R)","name":"Distant","mast":"527.6","km":527.6,"side":"LHS","rem":""},{"sr":855,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"LUR (R)","name":"Home","mast":"528.4","km":528.4,"side":"LHS","rem":""},{"sr":856,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"LUR (R)","name":"Starter","mast":"529.8","km":529.8,"side":"LHS","rem":""},{"sr":857,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"LUR (R)","name":"Adv. Starter","mast":"530.4","km":530.4,"side":"LHS","rem":""},{"sr":858,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"Gate","name":"Distant","mast":"532.35","km":532.35,"side":"LHS","rem":""},{"sr":859,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"Gate","name":"Gate Signal","mast":"533.35","km":533.35,"side":"LHS","rem":""},{"sr":860,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"Gate","name":"Distant","mast":"544.4","km":544.4,"side":"LHS","rem":""},{"sr":861,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"Gate","name":"Gate Signal","mast":"545.4","km":545.4,"side":"LHS","rem":""},{"sr":862,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"Gate","name":"Distant","mast":"548.5","km":548.5,"side":"LHS","rem":""},{"sr":863,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"Gate","name":"Gate Signal","mast":"549.45","km":549.45,"side":"LHS","rem":""},{"sr":864,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"Gate","name":"Distant","mast":"550.7","km":550.7,"side":"LHS","rem":""},{"sr":865,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"Gate","name":"Gate Signal","mast":"551.75","km":551.75,"side":"LHS","rem":""},{"sr":866,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"Gate - LTRR","name":"Neutral section","mast":"558.15","km":558.15,"side":"","rem":"Neutral Section"},{"sr":867,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"LTRR (L)","name":"Distant","mast":"560.45","km":560.45,"side":"LHS","rem":""},{"sr":868,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"LTRR (L)","name":"Home","mast":"561.8","km":561.8,"side":"LHS","rem":""},{"sr":869,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"LTRR (L)","name":"Starter","mast":"204.5","km":561.7,"side":"LHS","rem":""},{"sr":870,"sec":"KWV-LUR","cid":"c6","dir":1,"st":"LTRR (L)","name":"Adv. Starter","mast":"205.1","km":561.7,"side":"LHS","rem":""},{"sr":913,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"LTRR - Gate","name":"Neutral section","mast":"558.25","km":558.25,"side":"","rem":"Neutral Section"},{"sr":914,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"Gate","name":"Distant","mast":"553.3","km":553.3,"side":"LHS","rem":""},{"sr":915,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"Gate","name":"Gate Signal","mast":"552.35","km":552.35,"side":"LHS","rem":""},{"sr":916,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"Gate","name":"Distant","mast":"551.05","km":551.05,"side":"LHS","rem":""},{"sr":917,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"Gate","name":"Gate Signal","mast":"550.05","km":550.05,"side":"LHS","rem":""},{"sr":918,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"Gate","name":"Distant","mast":"546.75","km":546.75,"side":"LHS","rem":""},{"sr":919,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"Gate","name":"Gate Signal","mast":"545.8","km":545.8,"side":"LHS","rem":""},{"sr":920,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"Gate","name":"Distant","mast":"534.85","km":534.85,"side":"LHS","rem":""},{"sr":921,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"Gate","name":"Gate Signal","mast":"533.7","km":533.7,"side":"LHS","rem":""},{"sr":922,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"LUR","name":"Distant","mast":"531.55","km":531.55,"side":"LHS","rem":""},{"sr":923,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"LUR","name":"Home","mast":"530.6","km":530.6,"side":"LHS","rem":""},{"sr":924,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"LUR","name":"Starter","mast":"529.2","km":529.2,"side":"LHS","rem":""},{"sr":925,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"LUR","name":"Adv. Starter","mast":"528.6","km":528.6,"side":"LHS","rem":""},{"sr":926,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"Gate","name":"Distant","mast":"526.4","km":526.4,"side":"LHS","rem":""},{"sr":927,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"Gate","name":"Gate Signal","mast":"525.35","km":525.35,"side":"LHS","rem":""},{"sr":928,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"HARNGAUL","name":"Distant","mast":"522.95","km":522.95,"side":"LHS","rem":""},{"sr":929,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"HARNGAUL","name":"Home","mast":"521.95","km":521.95,"side":"LHS","rem":""},{"sr":930,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"HARNGAUL","name":"Starter","mast":"520.35","km":520.35,"side":"LHS","rem":""},{"sr":931,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"HARNGAUL","name":"Adv. Starter cum Gate Dist","mast":"520.05","km":520.05,"side":"LHS","rem":""},{"sr":932,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"Gate","name":"Gate Signal","mast":"519.3","km":519.3,"side":"LHS","rem":""},{"sr":934,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"OSA (L)","name":"Distant","mast":"512.4","km":512.4,"side":"LHS","rem":""},{"sr":935,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"OSA (L)","name":"Neutral section","mast":"512.1","km":512.1,"side":"","rem":"Neutral Section"},{"sr":936,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"OSA (L)","name":"Home","mast":"511.45","km":511.45,"side":"LHS","rem":""},{"sr":937,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"OSA (L)","name":"Starter","mast":"510.3","km":510.3,"side":"LHS","rem":""},{"sr":938,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"OSA (L)","name":"Adv. Starter","mast":"510.2","km":510.2,"side":"LHS","rem":""},{"sr":943,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"Gate","name":"Distant","mast":"501.7","km":501.7,"side":"LHS","rem":""},{"sr":944,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"Gate","name":"Gate Signal","mast":"500.5","km":500.5,"side":"LHS","rem":""},{"sr":946,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"Gate - MRX","name":"Neutral section","mast":"494.7","km":494.7,"side":"","rem":"Neutral Section"},{"sr":947,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"MRX","name":"Station / Halt","mast":"493.35","km":493.35,"side":"","rem":""},{"sr":948,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"Gate","name":"Distant","mast":"486.15","km":486.15,"side":"LHS","rem":""},{"sr":949,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"Gate","name":"Gate Signal","mast":"485.2","km":485.2,"side":"LHS","rem":""},{"sr":950,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"DKY (R)","name":"Distant","mast":"478.75","km":478.75,"side":"LHS","rem":""},{"sr":952,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"DKY (R)","name":"Home","mast":"478","km":478.0,"side":"LHS","rem":""},{"sr":953,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"DKY (R)","name":"Starter","mast":"476.6","km":476.6,"side":"LHS","rem":""},{"sr":954,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"DKY (R)","name":"Adv. Starter","mast":"476.2","km":476.2,"side":"LHS","rem":""},{"sr":955,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"Gate","name":"Distant","mast":"474.55","km":474.55,"side":"LHS","rem":""},{"sr":956,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"Gate","name":"Gate Signal","mast":"473.6","km":473.6,"side":"LHS","rem":""},{"sr":957,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"DKY - YSI","name":"Neutral section","mast":"472.05","km":472.05,"side":"","rem":"Neutral Section"},{"sr":961,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"YSI (R)","name":"Distant","mast":"462.45","km":462.45,"side":"LHS","rem":""},{"sr":962,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"YSI (R)","name":"Home","mast":"461.25","km":461.25,"side":"LHS","rem":""},{"sr":963,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"YSI (R)","name":"Starter","mast":"460.05","km":460.05,"side":"LHS","rem":""},{"sr":964,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"YSI (R)","name":"Adv. Starter","mast":"459.6","km":459.6,"side":"LHS","rem":""},{"sr":965,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"DRSV (L)","name":"Distant","mast":"452.45","km":452.45,"side":"LHS","rem":""},{"sr":967,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"DRSV (L)","name":"Home","mast":"451.55","km":451.55,"side":"LHS","rem":""},{"sr":969,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"DRSV (L)","name":"Starter","mast":"450.15","km":450.15,"side":"LHS","rem":""},{"sr":970,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"DRSV (L)","name":"Adv. Starter","mast":"449.6","km":449.6,"side":"LHS","rem":""},{"sr":972,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"DRSV - PJR","name":"Neutral section","mast":"442.6","km":442.6,"side":"","rem":"Neutral Section"},{"sr":974,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"PJR (R)","name":"Distant","mast":"433.5","km":433.5,"side":"LHS","rem":""},{"sr":975,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"PJR (R)","name":"Home","mast":"432.65","km":432.65,"side":"LHS","rem":""},{"sr":976,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"PJR (R)","name":"Starter","mast":"431.45","km":431.45,"side":"LHS","rem":""},{"sr":978,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"PJR (R)","name":"Adv. Starter","mast":"430.7","km":430.7,"side":"LHS","rem":""},{"sr":980,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"BTW (R)","name":"Distant","mast":"415.6","km":415.6,"side":"LHS","rem":""},{"sr":982,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"BTW (R)","name":"Home","mast":"414.75","km":414.75,"side":"LHS","rem":""},{"sr":983,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"BTW (R)","name":"Starter","mast":"413.2","km":413.2,"side":"LHS","rem":""},{"sr":984,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"BTW (R)","name":"Adv. Starter","mast":"412.85","km":412.85,"side":"LHS","rem":""},{"sr":985,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"BTW - Gate","name":"Neutral section","mast":"411.35","km":411.35,"side":"","rem":"Neutral Section"},{"sr":986,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"Gate","name":"Distant","mast":"409.65","km":409.65,"side":"LHS","rem":""},{"sr":988,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"Gate","name":"Gate Signal","mast":"408.5","km":408.5,"side":"LHS","rem":""},{"sr":989,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"SEI (R)","name":"Distant","mast":"398.2","km":398.2,"side":"LHS","rem":""},{"sr":990,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"SEI (R)","name":"Home","mast":"397.2","km":397.2,"side":"LHS","rem":""},{"sr":991,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"SEI (R)","name":"Starter","mast":"395.85","km":395.85,"side":"LHS","rem":""},{"sr":992,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"SEI (R)","name":"Adv. Starter","mast":"395.4","km":395.4,"side":"LHS","rem":""},{"sr":993,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"SEI - KWV","name":"Neutral section","mast":"390.35","km":390.35,"side":"","rem":"Neutral Section"},{"sr":995,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"KWV","name":"Distant","mast":"378.85","km":378.85,"side":"LHS","rem":""},{"sr":996,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"KWV","name":"Home","mast":"377.2","km":377.2,"side":"LHS","rem":""},{"sr":997,"sec":"LUR-KWV","cid":"c6","dir":-1,"st":"KWV","name":"Starter","mast":"376.6","km":376.6,"side":"LHS","rem":""},{"sr":1960,"sec":"KLBG-BIDR","cid":"c2","dir":1,"st":"KLBG","name":"Starter","mast":"110","km":567.95,"side":"LHS","rem":""},{"sr":1961,"sec":"KLBG-BIDR","cid":"c2","dir":1,"st":"KLBG","name":"Adv. Starter","mast":"109.05","km":568.9,"side":"LHS","rem":""},{"sr":1962,"sec":"KLBG-BIDR","cid":"c2","dir":1,"st":"Gate","name":"Distant","mast":"108.2","km":569.75,"side":"LHS","rem":""},{"sr":1963,"sec":"KLBG-BIDR","cid":"c2","dir":1,"st":"Gate","name":"Home (Gate)","mast":"107.2","km":570.75,"side":"LHS","rem":""},{"sr":1964,"sec":"KLBG-BIDR","cid":"c2","dir":1,"st":"TAJ SULTANAPUR","name":"Distant","mast":"100.4","km":577.55,"side":"LHS","rem":""},{"sr":1965,"sec":"KLBG-BIDR","cid":"c2","dir":1,"st":"TAJ SULTANAPUR","name":"Home","mast":"99.4","km":578.55,"side":"LHS","rem":""},{"sr":1966,"sec":"KLBG-BIDR","cid":"c2","dir":1,"st":"TAJ SULTANAPUR","name":"Starter","mast":"98.15","km":579.8,"side":"LHS","rem":""},{"sr":1967,"sec":"KLBG-BIDR","cid":"c2","dir":1,"st":"TAJ SULTANAPUR","name":"Adv. Starter","mast":"97.25","km":580.7,"side":"LHS","rem":""},{"sr":1968,"sec":"KLBG-BIDR","cid":"c2","dir":1,"st":"TAJ SULTANAPUR - KURUKOTTA","name":"Neutral section","mast":"95.6","km":582.35,"side":"","rem":"Neutral Section"},{"sr":2030,"sec":"TJSP-KLBG","cid":"c2","dir":-1,"st":"TAJ SULTANAPUR","name":"Distant","mast":"96.05","km":581.9,"side":"LHS","rem":""},{"sr":2031,"sec":"TJSP-KLBG","cid":"c2","dir":-1,"st":"TAJ SULTANAPUR","name":"Home","mast":"97.05","km":580.9,"side":"LHS","rem":""},{"sr":2032,"sec":"TJSP-KLBG","cid":"c2","dir":-1,"st":"TAJ SULTANAPUR","name":"Starter","mast":"98.5","km":579.45,"side":"LHS","rem":""},{"sr":2033,"sec":"TJSP-KLBG","cid":"c2","dir":-1,"st":"TAJ SULTANAPUR","name":"Adv. Starter","mast":"99.2","km":578.75,"side":"LHS","rem":""},{"sr":2034,"sec":"TJSP-KLBG","cid":"c2","dir":-1,"st":"Gate","name":"Distant","mast":"105.45","km":572.5,"side":"LHS","rem":""},{"sr":2035,"sec":"TJSP-KLBG","cid":"c2","dir":-1,"st":"Gate","name":"Gate","mast":"106.45","km":571.5,"side":"LHS","rem":""},{"sr":2036,"sec":"TJSP-KLBG","cid":"c2","dir":-1,"st":"KALABURAGI","name":"Distant","mast":"107.4","km":570.55,"side":"LHS","rem":""},{"sr":2037,"sec":"TJSP-KLBG","cid":"c2","dir":-1,"st":"KALABURAGI","name":"Home","mast":"108.45","km":569.5,"side":"LHS","rem":""},{"sr":2038,"sec":"TJSP-KLBG","cid":"c2","dir":-1,"st":"KALABURAGI","name":"Starter","mast":"566.8","km":566.8,"side":"LHS","rem":""}];
+
+      // Six color-coded corridors
+      const corridors = [
+        {
+          id: "c1", label: "WADI-SUR", color: "#059669", doubleLine: true,
+          stations: ["WADI", "SDB", "MR", "HQR", "KLBG", "BBD", "SVG", "HHD", "GUR", "GDGN", "KUI", "DUD", "BOT", "NGS", "AKOR", "TLT", "HG 'A' Cabin", "HG STN", "TKWD", "SUR"]
+        },
+        {
+          id: "c2", label: "KLBG-TJSP", color: "#e11d48", doubleLine: false,
+          stations: ["KLBG", "TJSP"]
+        },
+        {
+          id: "c3", label: "SUR-KWV", color: "#2563eb", doubleLine: true,
+          stations: ["SUR", "BALE", "PK", "MVE", "MO", "MKPT", "AAG", "WKA", "MA", "WDS", "KWV"]
+        },
+        {
+          id: "c4", label: "KWV-DD", color: "#d97706", doubleLine: true,
+          stations: ["KWV", "DHS", "KEM", "BLNI", "JEUR", "PPJ", "WSB", "KEU", "JNTR", "BGVN", "MLM", "BRB", "DD"]
+        },
+        {
+          id: "c5", label: "MRJ-KWV", color: "#7c3aed", doubleLine: false,
+          stations: ["MRJ", "BLWD", "BDK", "ARAG", "BLNK", "SGRE", "AGDl", "KVK", "LNP", "DLGN", "GLV", "JTRD", "MSDG", "JVA", "WSD", "SGLA", "BMNI", "BHLI", "PVR", "BBV", "AHI", "MLB", "PSS", "LAUL", "KWV"]
+        },
+        {
+          id: "c6", label: "KWV-LUR", color: "#0891b2", doubleLine: false,
+          stations: ["KWV", "CNHL", "MGO", "SEI", "UPI", "BTW", "KCB", "PJR", "YSI", "DRSV", "KRMD", "DKY", "TER", "PCP", "MRX", "NEI", "OSA", "HGL", "LUR", "BANL", "GANI"]
+        }
+      ];
+
+      const junctionStations = new Set(["WADI", "KLBG", "HG STN", "SUR", "KWV", "DD", "MRJ", "LUR"]);
+
+      const stationColorMap = {};
+      corridors.forEach(c => {
+        c.stations.forEach(st => {
+          if (!stationColorMap[st]) stationColorMap[st] = c.color;
+        });
+      });
+
+      const map = L.map("map", {
+        center: [17.75, 75.75],
+        zoom: 8,
+        zoomControl: true
+      });
+
+      map.createPane("railPane").style.zIndex = 410;
+      map.createPane("selectedRoutePane").style.zIndex = 425;
+      map.createPane("bridgePane").style.zIndex = 440;
+      map.createPane("stationPane").style.zIndex = 450;
+      map.createPane("signalPane").style.zIndex = 455;
+      map.createPane("lcPane").style.zIndex = 460;
+      map.createPane("boundaryPane").style.zIndex = 470;
+      map.createPane("liveGpsPane").style.zIndex = 490;
+
+      const basemaps = {
+        satellite: L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", {
+          attribution: "Tiles &copy; Esri", maxZoom: 19
+        }),
+        topo: L.tileLayer("https://services.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}", {
+          attribution: "Tiles &copy; Esri", maxZoom: 19
+        }),
+        dark: L.tileLayer("https://services.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}", {
+          attribution: "Tiles &copy; Esri", maxZoom: 16
+        })
+      };
+
+      let activeBasemap = basemaps.satellite;
+      activeBasemap.addTo(map);
+
+      map.on("dragstart", () => {
+        const followBox = document.getElementById("followGpsToggle");
+        if (followBox && followBox.checked && (watchId !== null || simTimer !== null)) {
+          followBox.checked = false;
+          showToast("Map unlocked for free route exploration · Tap 'My Position' to re-center");
+        }
+      });
+
+      const corridorLayers = {};
+      corridors.forEach(c => {
+        corridorLayers[c.id] = {
+          layer: L.layerGroup().addTo(map),
+          visible: true,
+          data: c
+        };
+      });
+
+      const selectedRouteHighlightLayer = L.layerGroup().addTo(map);
+      const stationsLayer = L.layerGroup().addTo(map);
+      const signalsLayer = L.layerGroup().addTo(map);
+      const labelsLayer = L.layerGroup();
+      const bridgesLayer = L.layerGroup().addTo(map);
+      const lcsLayer = L.layerGroup().addTo(map);
+      const boundariesLayer = L.layerGroup().addTo(map);
+      const liveGpsLayer = L.layerGroup().addTo(map);
+
+      const allBounds = L.latLngBounds();
+      const searchableItems = [];
+
+      function showToast(msg) {
+        const toast = document.getElementById("toastBanner");
+        toast.textContent = msg;
+        toast.classList.remove("hidden");
+        clearTimeout(showToast._timer);
+        showToast._timer = setTimeout(() => toast.classList.add("hidden"), 3200);
+      }
+
+      function haversineKm(lat1, lon1, lat2, lon2) {
+        const R = 6371;
+        const dLat = (lat2 - lat1) * Math.PI / 180;
+        const dLon = (lon2 - lon1) * Math.PI / 180;
+        const a =
+          Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+          Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+          Math.sin(dLon / 2) * Math.sin(dLon / 2);
+        return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+      }
+
+      function projectOnSegment(px, py, ax, ay, bx, by) {
+        const dx = bx - ax;
+        const dy = by - ay;
+        if (dx === 0 && dy === 0) {
+          return { t: 0, rawT: 0, lat: ax, lon: ay, distSq: (px - ax) * (px - ax) + (py - ay) * (py - ay) };
+        }
+        const rawT = ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy);
+        const t = Math.max(0, Math.min(1, rawT));
+        const cx = ax + t * dx;
+        const cy = ay + t * dy;
+        return { t, rawT, lat: cx, lon: cy, distSq: (px - cx) * (px - cx) + (py - cy) * (py - cy) };
+      }
+
+      const boundaryByName = {
+        VKB: boundaries[0],
+        RC: boundaries[1],
+        TJSP: boundaries[2],
+        TVL: boundaries[3],
+        DD: boundaries[4],
+        MRJ: boundaries[5],
+        LTRR: boundaries[6]
+      };
+
+      const stationNetAdj = {};
+      const stationInterpolatedKm = {};
+
+      const corridorGeometries = corridors.map(c => {
+        c.stations.forEach(st => {
+          const p = stationCoords[st];
+          allBounds.extend([p.lat, p.lon]);
+        });
+
+        const orderedNames = c.id === "c6"
+          ? ["KWV", "CNHL", "MGO", "SEI", "UPI", "BTW", "KCB", "PJR", "DRSV", "YSI", "KRMD", "DKY", "TER", "PCP", "MRX", "NEI", "OSA", "HGL", "LUR", "BANL", "GANI"]
+          : c.stations.slice();
+
+        const orderedPts = orderedNames.map(st => ({
+          stCode: st,
+          lat: stationCoords[st].lat,
+          lon: stationCoords[st].lon,
+          km: stationMeta[st] && stationMeta[st].km !== "" ? Number(stationMeta[st].km) : null
+        }));
+
+        let lastKnownIdx = -1;
+        for (let i = 0; i < orderedPts.length; i++) {
+          if (orderedPts[i].km !== null) {
+            if (lastKnownIdx === -1 && i > 0) {
+              for (let j = 0; j < i; j++) orderedPts[j].km = orderedPts[i].km;
+            } else if (lastKnownIdx !== -1 && i > lastKnownIdx + 1) {
+              const startKm = orderedPts[lastKnownIdx].km;
+              const endKm = orderedPts[i].km;
+              for (let j = lastKnownIdx + 1; j < i; j++) {
+                const frac = (j - lastKnownIdx) / (i - lastKnownIdx);
+                orderedPts[j].km = startKm + (endKm - startKm) * frac;
+              }
+            }
+            lastKnownIdx = i;
+          }
+        }
+        if (lastKnownIdx !== -1 && lastKnownIdx < orderedPts.length - 1) {
+          for (let j = lastKnownIdx + 1; j < orderedPts.length; j++) {
+            orderedPts[j].km = orderedPts[lastKnownIdx].km;
+          }
+        }
+
+        orderedPts.forEach(pt => {
+          if (stationInterpolatedKm[pt.stCode] === undefined) {
+            stationInterpolatedKm[pt.stCode] = pt.km || 0;
+          }
+        });
+
+        const segs = [];
+        for (let i = 0; i < orderedPts.length - 1; i++) {
+          const stA = orderedPts[i].stCode;
+          const stB = orderedPts[i + 1].stCode;
+          segs.push([
+            orderedPts[i].lat, orderedPts[i].lon,
+            orderedPts[i + 1].lat, orderedPts[i + 1].lon,
+            orderedPts[i].km || 0, orderedPts[i + 1].km || 0,
+            stA, stB
+          ]);
+          if (!stationNetAdj[stA]) stationNetAdj[stA] = [];
+          if (!stationNetAdj[stB]) stationNetAdj[stB] = [];
+          stationNetAdj[stA].push({ to: stB, cid: c.id, blockIdx: i, forward: true });
+          stationNetAdj[stB].push({ to: stA, cid: c.id, blockIdx: i, forward: false });
+        }
+
+        const boundarySegs = [];
+        if (c.id === "c1") {
+          boundarySegs.push([stationCoords["WADI"].lat, stationCoords["WADI"].lon, boundaryByName.VKB.lat, boundaryByName.VKB.lon]);
+          boundarySegs.push([stationCoords["WADI"].lat, stationCoords["WADI"].lon, boundaryByName.RC.lat, boundaryByName.RC.lon]);
+          boundarySegs.push([stationCoords["HG 'A' Cabin"].lat, stationCoords["HG 'A' Cabin"].lon, boundaryByName.TVL.lat, boundaryByName.TVL.lon]);
+        } else if (c.id === "c2") {
+          boundarySegs.push([stationCoords["TJSP"].lat, stationCoords["TJSP"].lon, boundaryByName.TJSP.lat, boundaryByName.TJSP.lon]);
+        } else if (c.id === "c4") {
+          boundarySegs.push([boundaryByName.DD.lat, boundaryByName.DD.lon, stationCoords["DD"].lat, stationCoords["DD"].lon]);
+        } else if (c.id === "c5") {
+          boundarySegs.push([stationCoords["MRJ"].lat, stationCoords["MRJ"].lon, boundaryByName.MRJ.lat, boundaryByName.MRJ.lon]);
+          boundarySegs.push([boundaryByName.MRJ.lat, boundaryByName.MRJ.lon, stationCoords["BLWD"].lat, stationCoords["BLWD"].lon]);
+        } else if (c.id === "c6") {
+          boundarySegs.push([stationCoords["GANI"].lat, stationCoords["GANI"].lon, boundaryByName.LTRR.lat, boundaryByName.LTRR.lon]);
+        }
+
+        return {
+          id: c.id,
+          label: c.label,
+          color: c.color,
+          doubleLine: c.doubleLine,
+          orderedNames,
+          segs,
+          boundarySegs,
+          pts: orderedPts
+        };
+      });
+
+      const corridorMap = {};
+      corridorGeometries.forEach(c => { corridorMap[c.id] = c; });
+
+      const fromStationSelect = document.getElementById("fromStationSelect");
+      const toStationSelect = document.getElementById("toStationSelect");
+
+      function populateStationDropdowns() {
+        fromStationSelect.innerHTML = "";
+        toStationSelect.innerHTML = "";
+        corridorGeometries.forEach(c => {
+          const groupFrom = document.createElement("optgroup");
+          groupFrom.label = `${c.label} (${c.doubleLine ? "Double" : "Single"})`;
+          const groupTo = document.createElement("optgroup");
+          groupTo.label = `${c.label} (${c.doubleLine ? "Double" : "Single"})`;
+
+          c.orderedNames.forEach(st => {
+            const kmTxt = stationMeta[st] && stationMeta[st].km !== "" ? ` · Km ${stationMeta[st].km}` : "";
+            const opt1 = document.createElement("option");
+            opt1.value = st;
+            opt1.textContent = `${st}${kmTxt}`;
+            groupFrom.appendChild(opt1);
+
+            const opt2 = document.createElement("option");
+            opt2.value = st;
+            opt2.textContent = `${st}${kmTxt}`;
+            groupTo.appendChild(opt2);
+          });
+
+          fromStationSelect.appendChild(groupFrom);
+          toStationSelect.appendChild(groupTo);
+        });
+        fromStationSelect.value = "SUR";
+        toStationSelect.value = "KWV";
+      }
+      populateStationDropdowns();
+
+      function findStationRouteChain(fromSt, toSt) {
+        if (!fromSt || !toSt) return null;
+        if (fromSt === toSt) {
+          return { stations: [fromSt], steps: [] };
+        }
+        const queue = [fromSt];
+        const visited = new Set([fromSt]);
+        const parent = {};
+
+        while (queue.length > 0) {
+          const cur = queue.shift();
+          if (cur === toSt) {
+            const steps = [];
+            const stations = [toSt];
+            let node = toSt;
+            while (parent[node]) {
+              steps.push(parent[node].step);
+              stations.push(parent[node].prevSt);
+              node = parent[node].prevSt;
+            }
+            steps.reverse();
+            stations.reverse();
+            return { stations, steps };
+          }
+          const neighbors = stationNetAdj[cur] || [];
+          for (let i = 0; i < neighbors.length; i++) {
+            const edge = neighbors[i];
+            if (!visited.has(edge.to)) {
+              visited.add(edge.to);
+              parent[edge.to] = { prevSt: cur, step: edge };
+              queue.push(edge.to);
+            }
+          }
+        }
+        return null;
+      }
+
+      // =========================================================================
+      // DUAL-LINE JUNCTION SUPPORT AT KLBG & COMPLETE BOUNDARY COVERAGE AT DD
+      // =========================================================================
+      function isPointOnWadiSurMainLineAtKlbg(lat, lon) {
+        // Only exclude the northward TJSP branch (above lat 17.340 east of 76.805, or above 17.330 east of 76.818)
+        // so 100% of the curved HQR -> KLBG -> BBD double-line segments are preserved!
+        if (lat > 17.340 && lon > 76.805 && lon < 76.885) return false;
+        if (lat > 17.330 && lon > 76.818 && lon < 76.885) return false;
+        return true;
+      }
+
+      function isPointOnKlbgTjspCorridor(lat, lon) {
+        // Generous envelope covering the full KLBG -> turnout -> TJSP -> TJSP Boundary curve
+        if (lat < stationCoords["KLBG"].lat - 0.004) return false;
+        if (lat > boundaryByName.TJSP.lat + 0.0025) return false;
+        if (lon < 76.788 || lon > 76.880) return false;
+        const klbg = stationCoords["KLBG"];
+        const tjsp = stationCoords["TJSP"];
+        const bnd = boundaryByName.TJSP;
+        const turnLat = 17.3265, turnLon = 76.8015;
+        const s1 = projectOnSegment(lat, lon, klbg.lat, klbg.lon, turnLat, turnLon);
+        const s2 = projectOnSegment(lat, lon, turnLat, turnLon, tjsp.lat, tjsp.lon);
+        const s3 = projectOnSegment(lat, lon, tjsp.lat, tjsp.lon, bnd.lat, bnd.lon);
+        const sDirect = projectOnSegment(lat, lon, klbg.lat, klbg.lon, tjsp.lat, tjsp.lon);
+        return Math.sqrt(Math.min(s1.distSq, s2.distSq, s3.distSq, sDirect.distSq)) <= 0.045;
+      }
+
+      function isPointWithinCorridorBoundary(cid, lat, lon) {
+        if (cid === "c1") {
+          if (lon > boundaryByName.VKB.lon + 0.0015) return false;
+          if (lat < boundaryByName.RC.lat - 0.0015) return false;
+          if (lon < 76.02 && lat < boundaryByName.TVL.lat - 0.0015) return false;
+          if (lat > stationCoords["SUR"].lat + 0.004 && lon < stationCoords["SUR"].lon - 0.004) return false;
+          if (!isPointOnWadiSurMainLineAtKlbg(lat, lon)) return false;
+          return true;
+        }
+        if (cid === "c2") {
+          return isPointOnKlbgTjspCorridor(lat, lon);
+        }
+        if (cid === "c3") {
+          if (lat < stationCoords["SUR"].lat - 0.003 || lon > stationCoords["SUR"].lon + 0.003) return false;
+          if (lat > stationCoords["KWV"].lat + 0.003 || lon < stationCoords["KWV"].lon - 0.003) return false;
+          return true;
+        }
+        if (cid === "c4") {
+          // Strict envelope around Daund (DD) so Pune (west), Manmad (north), and Baramati (south) branches are excluded
+          if (lon < stationCoords["DD"].lon - 0.0025) return false;
+          if (lat > stationCoords["DD"].lat + 0.0022) return false;
+          if (lon < 74.605 && lat < 18.452) return false;
+          if (lon > stationCoords["KWV"].lon + 0.003 && lat < stationCoords["KWV"].lat - 0.003) return false;
+          return true;
+        }
+        if (cid === "c5") {
+          if (lon < stationCoords["MRJ"].lon - 0.001) return false;
+          if (lat < boundaryByName.MRJ.lat - 0.001) return false;
+          if (lat > stationCoords["KWV"].lat + 0.002) return false;
+          if (lon < 74.675 && lat > 16.824) return false;
+          return true;
+        }
+        if (cid === "c6") {
+          if (lat > boundaryByName.LTRR.lat + 0.001) return false;
+          if (lon > boundaryByName.LTRR.lon + 0.001) return false;
+          if (lon < stationCoords["KWV"].lon - 0.002) return false;
+          return true;
+        }
+        return true;
+      }
+
+      function minDistanceToCorridor(c, lat, lon) {
+        if (c.id === "c2") {
+          if (!isPointOnKlbgTjspCorridor(lat, lon)) return Infinity;
+          const klbg = stationCoords["KLBG"];
+          const tjsp = stationCoords["TJSP"];
+          const bnd = boundaryByName.TJSP;
+          const turnLat = 17.3265, turnLon = 76.8015;
+          const s1 = projectOnSegment(lat, lon, klbg.lat, klbg.lon, turnLat, turnLon);
+          const s2 = projectOnSegment(lat, lon, turnLat, turnLon, tjsp.lat, tjsp.lon);
+          const s3 = projectOnSegment(lat, lon, tjsp.lat, tjsp.lon, bnd.lat, bnd.lon);
+          return Math.sqrt(Math.min(s1.distSq, s2.distSq, s3.distSq));
+        }
+
+        let minSq = Infinity;
+        for (let i = 0; i < c.segs.length; i++) {
+          const s = c.segs[i];
+          const proj = projectOnSegment(lat, lon, s[0], s[1], s[2], s[3]);
+          if (i === 0 && proj.rawT < -0.005) continue;
+          if (i === c.segs.length - 1 && proj.rawT > 1.005) continue;
+          if (proj.distSq < minSq) minSq = proj.distSq;
+        }
+        for (let i = 0; i < c.boundarySegs.length; i++) {
+          const bs = c.boundarySegs[i];
+          const proj = projectOnSegment(lat, lon, bs[0], bs[1], bs[2], bs[3]);
+          if (proj.rawT < -0.005 || proj.rawT > 1.005) continue;
+          if (proj.distSq < minSq) minSq = proj.distSq;
+        }
+        return Math.sqrt(minSq);
+      }
+
+      function clipWayForCorridor(geom, c) {
+        const pieces = [];
+        let run = [];
+        for (let i = 0; i < geom.length; i++) {
+          const pt = geom[i];
+          const maxTol = c.id === "c2" ? 0.045 : ((c.id === "c4" && pt.lon < 74.62) ? 0.012 : 0.035);
+          if (isPointWithinCorridorBoundary(c.id, pt.lat, pt.lon) && minDistanceToCorridor(c, pt.lat, pt.lon) <= maxTol) {
+            run.push([Number(pt.lat.toFixed(6)), Number(pt.lon.toFixed(6))]);
+          } else {
+            if (run.length >= 2) pieces.push({ cid: c.id, pts: run });
+            run = [];
+          }
+        }
+        if (run.length >= 2) pieces.push({ cid: c.id, pts: run });
+        return pieces;
+      }
+
+      function matchAndClipWay(geom) {
+        const results = [];
+
+        const c2Pieces = clipWayForCorridor(geom, corridorMap["c2"]);
+        for (let i = 0; i < c2Pieces.length; i++) {
+          results.push(c2Pieces[i]);
+        }
+
+        const samples = [
+          geom[0],
+          geom[Math.floor(geom.length / 2)],
+          geom[geom.length - 1]
+        ];
+
+        let bestCid = null;
+        let bestScore = Infinity;
+
+        for (const c of corridorGeometries) {
+          if (c.id === "c2") continue;
+          let sum = 0;
+          let validSamples = 0;
+          for (const pt of samples) {
+            if (isPointWithinCorridorBoundary(c.id, pt.lat, pt.lon)) {
+              validSamples++;
+            }
+            sum += minDistanceToCorridor(c, pt.lat, pt.lon);
+          }
+          if (validSamples === 0) continue;
+          const avg = sum / samples.length;
+          if (avg < bestScore) {
+            bestScore = avg;
+            bestCid = c.id;
+          }
+        }
+
+        if (bestCid && bestScore <= 0.032) {
+          const otherPieces = clipWayForCorridor(geom, corridorMap[bestCid]);
+          for (let i = 0; i < otherPieces.length; i++) {
+            results.push(otherPieces[i]);
+          }
+        }
+
+        return results;
+      }
+
+      // =========================================================================
+      // EXACT GRAPH-BASED PATH TRACER ON THE 321 RENDERED REAL TRACK SEGMENTS
+      // ZERO SHORTCUTS — SIMULATION FOLLOWS EVERY CURVE OF THE REAL TRACK!
+      // =========================================================================
+      let realTrackLoaded = false;
+      const realTrackSegmentsByCorridor = { c1: [], c2: [], c3: [], c4: [], c5: [], c6: [] };
+      const blockRealTrackPoints = {};
+
+      function clearCorridorTracks() {
+        Object.values(corridorLayers).forEach(entry => entry.layer.clearLayers());
+        Object.keys(realTrackSegmentsByCorridor).forEach(k => {
+          realTrackSegmentsByCorridor[k] = [];
+        });
+        Object.keys(blockRealTrackPoints).forEach(k => delete blockRealTrackPoints[k]);
+      }
+
+      class MinHeap {
+        constructor() { this.items = []; }
+        push(node) {
+          this.items.push(node);
+          let i = this.items.length - 1;
+          while (i > 0) {
+            const p = (i - 1) >> 1;
+            if (this.items[p].f <= this.items[i].f) break;
+            const tmp = this.items[p]; this.items[p] = this.items[i]; this.items[i] = tmp;
+            i = p;
+          }
+        }
+        pop() {
+          const top = this.items[0];
+          const last = this.items.pop();
+          if (this.items.length > 0) {
+            this.items[0] = last;
+            let i = 0, len = this.items.length;
+            while (true) {
+              let l = i * 2 + 1, r = l + 1, sm = i;
+              if (l < len && this.items[l].f < this.items[sm].f) sm = l;
+              if (r < len && this.items[r].f < this.items[sm].f) sm = r;
+              if (sm === i) break;
+              const tmp = this.items[i]; this.items[i] = this.items[sm]; this.items[sm] = tmp;
+              i = sm;
+            }
+          }
+          return top;
+        }
+        get size() { return this.items.length; }
+      }
+
+      // Resample any long straight edge along the real track into ~350m steps so animation speed is smooth
+      function resamplePolylinePoints(rawPts, cid) {
+        if (!rawPts || rawPts.length === 0) return [];
+        const out = [{ lat: rawPts[0][0], lon: rawPts[0][1], cid }];
+        for (let i = 1; i < rawPts.length; i++) {
+          const prev = out[out.length - 1];
+          const curLat = rawPts[i][0], curLon = rawPts[i][1];
+          const d = haversineKm(prev.lat, prev.lon, curLat, curLon);
+          if (d > 0.45) {
+            const steps = Math.ceil(d / 0.35);
+            for (let s = 1; s <= steps; s++) {
+              const t = s / steps;
+              out.push({
+                lat: prev.lat + (curLat - prev.lat) * t,
+                lon: prev.lon + (curLon - prev.lon) * t,
+                cid
+              });
+            }
+          } else if (d >= 0.12 || i === rawPts.length - 1) {
+            out.push({ lat: curLat, lon: curLon, cid });
+          }
+        }
+        return out;
+      }
+
+      // Build a topological graph from ONLY the rendered real track polylines of corridor `c.id`,
+      // stitch any minor OSM segment gaps, and solve each station-to-station block strictly along the real track!
+      function buildCorridorBlocksFromRealWays(c, polylines) {
+        if (!polylines || polylines.length === 0) return;
+
+        const nodes = [];
+        const keyToId = new Map();
+
+        function getOrCreateNode(lat, lon) {
+          // 5 decimal places (~1.1 m) connects all contiguous OSM segments
+          const key = lat.toFixed(5) + "," + lon.toFixed(5);
+          if (keyToId.has(key)) return keyToId.get(key);
+          const id = nodes.length;
+          keyToId.set(key, id);
+          nodes.push({ id, lat, lon, adj: [], comp: -1 });
+          return id;
+        }
+
+        function addEdge(u, v, cost, trueKm) {
+          if (u === v) return;
+          nodes[u].adj.push({ to: v, cost, trueKm });
+          nodes[v].adj.push({ to: u, cost, trueKm });
+        }
+
+        // 1. Insert every rendered real-track polyline into this corridor's graph
+        polylines.forEach(pts => {
+          let prevId = getOrCreateNode(pts[0][0], pts[0][1]);
+          for (let i = 1; i < pts.length; i++) {
+            const curId = getOrCreateNode(pts[i][0], pts[i][1]);
+            const a = nodes[prevId], b = nodes[curId];
+            const d = haversineKm(a.lat, a.lon, b.lat, b.lon);
+            addEdge(prevId, curId, d, d);
+            prevId = curId;
+          }
+        });
+
+        // 2. Connect nearby endpoints/nodes within 120m (e.g., OSM crossover/bridge splits) with low gap cost
+        const deg1 = nodes.filter(n => n.adj.length === 1);
+        for (let i = 0; i < deg1.length; i++) {
+          const a = deg1[i];
+          for (let j = i + 1; j < deg1.length; j++) {
+            const b = deg1[j];
+            if (Math.abs(a.lat - b.lat) > 0.0025 || Math.abs(a.lon - b.lon) > 0.0025) continue;
+            const d = haversineKm(a.lat, a.lon, b.lat, b.lon);
+            if (d <= 0.25) {
+              addEdge(a.id, b.id, d * 3.0, d);
+            }
+          }
+        }
+
+        // 3. Label connected components and bridge any remaining split gaps between adjacent real-track components
+        function computeComponents() {
+          nodes.forEach(n => { n.comp = -1; });
+          let compCount = 0;
+          for (let i = 0; i < nodes.length; i++) {
+            if (nodes[i].comp !== -1) continue;
+            const q = [i];
+            nodes[i].comp = compCount;
+            while (q.length > 0) {
+              const u = q.shift();
+              const adj = nodes[u].adj;
+              for (let k = 0; k < adj.length; k++) {
+                const v = adj[k].to;
+                if (nodes[v].comp === -1) {
+                  nodes[v].comp = compCount;
+                  q.push(v);
+                }
+              }
+            }
+            compCount++;
+          }
+          return compCount;
+        }
+
+        let numComps = computeComponents();
+        // Bridge disconnected components locally if OSM has a gap > 250m (up to 4 km) using heavy penalty so real track is always preferred
+        let safety = 0;
+        while (numComps > 1 && safety < 40) {
+          safety++;
+          let bestU = -1, bestV = -1, bestD = 4.5;
+          // Compare endpoints / vertices of comp 0 vs other comps
+          const comp0Nodes = nodes.filter(n => n.comp === 0);
+          const otherNodes = nodes.filter(n => n.comp !== 0);
+          for (let i = 0; i < comp0Nodes.length; i += 2) {
+            const a = comp0Nodes[i];
+            for (let j = 0; j < otherNodes.length; j += 2) {
+              const b = otherNodes[j];
+              if (Math.abs(a.lat - b.lat) > 0.045 || Math.abs(a.lon - b.lon) > 0.045) continue;
+              const d = haversineKm(a.lat, a.lon, b.lat, b.lon);
+              if (d < bestD) {
+                bestD = d;
+                bestU = a.id;
+                bestV = b.id;
+              }
+            }
+          }
+          if (bestU !== -1 && bestV !== -1) {
+            addEdge(bestU, bestV, bestD * 6.0, bestD);
+            numComps = computeComponents();
+          } else {
+            break;
+          }
+        }
+
+        // 4. Add tiny crossover links at every station between parallel Up/Down tracks (within 200m of station)
+        // so Dijkstra never backtracks to a previous station to switch tracks!
+        c.pts.forEach(st => {
+          const nearSt = [];
+          for (let i = 0; i < nodes.length; i++) {
+            const n = nodes[i];
+            if (Math.abs(n.lat - st.lat) > 0.003 || Math.abs(n.lon - st.lon) > 0.003) continue;
+            const d = haversineKm(n.lat, n.lon, st.lat, st.lon);
+            if (d <= 0.22) nearSt.push({ id: i, d });
+          }
+          if (nearSt.length > 1) {
+            nearSt.sort((a, b) => a.d - b.d);
+            const anchorId = nearSt[0].id;
+            for (let k = 1; k < nearSt.length; k++) {
+              const otherId = nearSt[k].id;
+              const dEdge = haversineKm(nodes[anchorId].lat, nodes[anchorId].lon, nodes[otherId].lat, nodes[otherId].lon);
+              addEdge(anchorId, otherId, dEdge * 1.5, dEdge);
+            }
+          }
+        });
+
+        function nearestNodeTo(lat, lon) {
+          let bestId = -1, bestD = Infinity;
+          for (let i = 0; i < nodes.length; i++) {
+            const n = nodes[i];
+            const dSq = (n.lat - lat) * (n.lat - lat) + (n.lon - lon) * (n.lon - lon);
+            if (dSq < bestD) {
+              bestD = dSq;
+              bestId = n.id;
+            }
+          }
+          return bestId;
+        }
+
+        function findExactRealTrackPath(stA, stB, forcedStartId) {
+          const startId = (forcedStartId !== undefined && forcedStartId !== -1) ? forcedStartId : nearestNodeTo(stA[0], stA[1]);
+          const endId = nearestNodeTo(stB[0], stB[1]);
+          if (startId === -1 || endId === -1) return null;
+
+          const gScore = new Float64Array(nodes.length).fill(Infinity);
+          const prev = new Int32Array(nodes.length).fill(-1);
+          const visited = new Uint8Array(nodes.length);
+          const pq = new MinHeap();
+
+          gScore[startId] = 0;
+          pq.push({ id: startId, f: haversineKm(nodes[startId].lat, nodes[startId].lon, stB[0], stB[1]) });
+
+          while (pq.size > 0) {
+            const cur = pq.pop();
+            if (cur.id === endId) {
+              const rawChain = [];
+              let u = endId;
+              while (u !== -1) {
+                rawChain.push([nodes[u].lat, nodes[u].lon]);
+                u = prev[u];
+              }
+              rawChain.reverse();
+              return { path: resamplePolylinePoints(rawChain, c.id), endId };
+            }
+            if (visited[cur.id]) continue;
+            visited[cur.id] = 1;
+
+            const curG = gScore[cur.id];
+            const adj = nodes[cur.id].adj;
+            for (let i = 0; i < adj.length; i++) {
+              const edge = adj[i];
+              if (visited[edge.to]) continue;
+              const n = nodes[edge.to];
+              // Keep within generous block bounds so all real railway curves are followed without falling back to straight shortcuts
+              if (c.id !== "c2") {
+                const projNext = projectOnSegment(n.lat, n.lon, stA[0], stA[1], stB[0], stB[1]);
+                if (projNext.rawT < -0.12 || projNext.rawT > 1.12) continue;
+              }
+              const tentG = curG + edge.cost;
+              if (tentG < gScore[edge.to]) {
+                gScore[edge.to] = tentG;
+                prev[edge.to] = cur.id;
+                const h = haversineKm(n.lat, n.lon, stB[0], stB[1]);
+                pq.push({ id: edge.to, f: tentG + h });
+              }
+            }
+          }
+          return null;
+        }
+
+        // Solve every consecutive station-to-station block along the exact rendered real-track graph,
+        // chaining endId -> next startId so there is zero backtracking at intermediate stations!
+        let prevEndId = -1;
+        for (let bIdx = 0; bIdx < c.segs.length; bIdx++) {
+          const s = c.segs[bIdx];
+          const key = `${c.id}:${bIdx}`;
+          let res = findExactRealTrackPath([s[0], s[1]], [s[2], s[3]], prevEndId);
+          if (!res && prevEndId !== -1) {
+            res = findExactRealTrackPath([s[0], s[1]], [s[2], s[3]], -1);
+          }
+          if (res && res.path && res.path.length >= 2) {
+            blockRealTrackPoints[key] = res.path;
+            prevEndId = res.endId;
+          } else {
+            blockRealTrackPoints[key] = [
+              { lat: s[0], lon: s[1], cid: c.id },
+              { lat: s[2], lon: s[3], cid: c.id }
+            ];
+            prevEndId = -1;
+          }
+        }
+      }
+
+      function renderRealTrackWays(waysList) {
+        clearCorridorTracks();
+        let matchedCount = 0;
+        const polylinesByCorridor = { c1: [], c2: [], c3: [], c4: [], c5: [], c6: [] };
+
+        waysList.forEach(w => {
+          const entry = corridorLayers[w.cid];
+          if (!entry || !Array.isArray(w.pts) || w.pts.length < 2) return;
+
+          const cleanPts = w.pts.filter(p => isPointWithinCorridorBoundary(w.cid, p[0], p[1]));
+          if (cleanPts.length < 2) return;
+
+          const isDouble = entry.data.doubleLine;
+
+          L.polyline(cleanPts, {
+            pane: "railPane",
+            color: "#0f172a",
+            weight: isDouble ? 6.5 : 5.2,
+            opacity: 0.55,
+            lineCap: "round",
+            lineJoin: "round",
+            interactive: false
+          }).addTo(entry.layer);
+
+          L.polyline(cleanPts, {
+            pane: "railPane",
+            color: entry.data.color,
+            weight: isDouble ? 3.8 : 3.4,
+            opacity: 0.98,
+            lineCap: "round",
+            lineJoin: "round",
+            interactive: false
+          }).addTo(entry.layer);
+
+          polylinesByCorridor[w.cid].push(cleanPts);
+
+          const corrSegs = realTrackSegmentsByCorridor[w.cid];
+          for (let i = 0; i < cleanPts.length - 1; i++) {
+            corrSegs.push({
+              cid: w.cid,
+              ax: cleanPts[i][0],
+              ay: cleanPts[i][1],
+              bx: cleanPts[i + 1][0],
+              by: cleanPts[i + 1][1]
+            });
+          }
+
+          matchedCount++;
+        });
+
+        // Build exact graph-traced station-to-station paths strictly from the rendered real-track segments
+        corridorGeometries.forEach(c => {
+          buildCorridorBlocksFromRealWays(c, polylinesByCorridor[c.id]);
+        });
+
+        realTrackLoaded = matchedCount > 0;
+        return matchedCount;
+      }
+
+      let activeCustomRoute = {
+        fromSt: "SUR",
+        toSt: "KWV",
+        stations: [],
+        cids: new Set(["c3"]),
+        trackPts: [],
+        totalKm: 0
+      };
+
+      function buildSelectedRouteFromStations(fromSt, toSt, fitMapToRoute) {
+        const solved = findStationRouteChain(fromSt, toSt);
+        selectedRouteHighlightLayer.clearLayers();
+        if (typeof announcedSignalStages !== "undefined") announcedSignalStages = {};
+
+        if (!solved || solved.stations.length === 0) {
+          return;
+        }
+
+        const fullTrackPts = [];
+        const activeCids = new Set();
+
+        if (solved.steps.length === 0) {
+          const p = stationCoords[fromSt];
+          fullTrackPts.push({ lat: p.lat, lon: p.lon, cid: "c3" });
+        } else {
+          solved.steps.forEach((step, idx) => {
+            activeCids.add(step.cid);
+            const key = `${step.cid}:${step.blockIdx}`;
+            const rawBlockPts = blockRealTrackPoints[key];
+            let blockPts = [];
+            if (rawBlockPts && rawBlockPts.length >= 2) {
+              blockPts = step.forward ? rawBlockPts.slice() : rawBlockPts.slice().reverse();
+            } else {
+              const s = corridorMap[step.cid].segs[step.blockIdx];
+              blockPts = step.forward
+                ? [{ lat: s[0], lon: s[1], cid: step.cid }, { lat: s[2], lon: s[3], cid: step.cid }]
+                : [{ lat: s[2], lon: s[3], cid: step.cid }, { lat: s[0], lon: s[1], cid: step.cid }];
+            }
+
+            for (let k = 0; k < blockPts.length; k++) {
+              if (idx > 0 && k === 0) continue;
+              fullTrackPts.push({ lat: blockPts[k].lat, lon: blockPts[k].lon, cid: step.cid, blockIdx: step.blockIdx, dir: step.forward ? 1 : -1 });
+            }
+          });
+        }
+
+        // Enforce strictly one-way path along the real railway track:
+        // Remove any to-and-fro loop returns (<= 180m) or sharp 120°-180° U-turn reversals without cutting real curves
+        if (fullTrackPts.length >= 4) {
+          let cleaned = fullTrackPts.slice();
+          let changed = true;
+          let passes = 0;
+          while (changed && passes < 8) {
+            changed = false;
+            passes++;
+
+            // Pass A: Excise any local loop where path goes out and returns within 180m
+            const loopFree = [];
+            let i = 0;
+            while (i < cleaned.length) {
+              loopFree.push(cleaned[i]);
+              let jumpTo = -1;
+              const maxLook = Math.min(cleaned.length - 1, i + 30);
+              for (let j = i + 2; j <= maxLook; j++) {
+                if (haversineKm(cleaned[i].lat, cleaned[i].lon, cleaned[j].lat, cleaned[j].lon) <= 0.18) {
+                  jumpTo = j;
+                }
+              }
+              if (jumpTo !== -1) {
+                i = jumpTo + 1;
+                changed = true;
+              } else {
+                i++;
+              }
+            }
+            cleaned = loopFree;
+
+            // Pass B: Remove any sharp to-and-fro U-turn spike (cos(angle) < -0.5, i.e. > 120 deg reversal)
+            if (cleaned.length >= 3) {
+              const noUturn = [cleaned[0]];
+              for (let k = 1; k < cleaned.length - 1; k++) {
+                const a = noUturn[noUturn.length - 1];
+                const b = cleaned[k];
+                const cPt = cleaned[k + 1];
+                const v1x = b.lat - a.lat, v1y = b.lon - a.lon;
+                const v2x = cPt.lat - b.lat, v2y = cPt.lon - b.lon;
+                const len1 = Math.hypot(v1x, v1y);
+                const len2 = Math.hypot(v2x, v2y);
+                if (len1 > 0 && len2 > 0) {
+                  const cosTheta = (v1x * v2x + v1y * v2y) / (len1 * len2);
+                  if (cosTheta < -0.5) {
+                    changed = true;
+                    continue;
+                  }
+                }
+                noUturn.push(b);
+              }
+              noUturn.push(cleaned[cleaned.length - 1]);
+              cleaned = noUturn;
+            }
+          }
+          fullTrackPts.length = 0;
+          for (let k = 0; k < cleaned.length; k++) fullTrackPts.push(cleaned[k]);
+        }
+
+        // Exact curved real-track distance along the 321 segments
+        let totalKm = 0;
+        for (let i = 0; i < fullTrackPts.length - 1; i++) {
+          totalKm += haversineKm(fullTrackPts[i].lat, fullTrackPts[i].lon, fullTrackPts[i + 1].lat, fullTrackPts[i + 1].lon);
+        }
+
+        // Precompute cumulative distance along the route and index Stations, LCs, and Bridges in forward route order
+        const cumDist = new Float64Array(fullTrackPts.length);
+        cumDist[0] = 0;
+        for (let i = 1; i < fullTrackPts.length; i++) {
+          cumDist[i] = cumDist[i - 1] + haversineKm(fullTrackPts[i - 1].lat, fullTrackPts[i - 1].lon, fullTrackPts[i].lat, fullTrackPts[i].lon);
+        }
+
+        function projectAssetOntoRoute(lat, lon, minSearchIdx) {
+          let bestIdx = 0;
+          let bestDist = Infinity;
+          const start = minSearchIdx || 0;
+          for (let i = start; i < fullTrackPts.length; i++) {
+            const d = haversineKm(lat, lon, fullTrackPts[i].lat, fullTrackPts[i].lon);
+            if (d < bestDist) {
+              bestDist = d;
+              bestIdx = i;
+            }
+          }
+          return { routeIdx: bestIdx, distKm: bestDist };
+        }
+
+        const routeStations = [];
+        let lastStIdx = 0;
+        solved.stations.forEach(code => {
+          const p = stationCoords[code];
+          const proj = projectAssetOntoRoute(p.lat, p.lon, lastStIdx);
+          lastStIdx = proj.routeIdx;
+          routeStations.push({ code, routeIdx: proj.routeIdx, cumKm: cumDist[proj.routeIdx] || 0 });
+        });
+
+        const routeLcs = [];
+        lcMarkers.forEach(item => {
+          const proj = projectAssetOntoRoute(item.data.lat, item.data.lon, 0);
+          if (proj.distKm <= 0.9) {
+            routeLcs.push({ item, routeIdx: proj.routeIdx, cumKm: cumDist[proj.routeIdx] || 0 });
+          }
+        });
+        routeLcs.sort((a, b) => a.routeIdx - b.routeIdx);
+
+        const routeBridges = [];
+        bridgeMarkers.forEach(item => {
+          const proj = projectAssetOntoRoute(item.data.lat, item.data.lon, 0);
+          if (proj.distKm <= 0.9) {
+            routeBridges.push({ item, routeIdx: proj.routeIdx, cumKm: cumDist[proj.routeIdx] || 0 });
+          }
+        });
+        routeBridges.sort((a, b) => a.routeIdx - b.routeIdx);
+
+        const routeSignals = [];
+        if (typeof signalMarkers !== "undefined" && solved.steps.length > 0) {
+          const activeStepSet = new Set(solved.steps.map(st => `${st.cid}:${st.blockIdx}:${st.forward ? 1 : -1}`));
+          signalMarkers.forEach(item => {
+            const d = item.data;
+            if (!d.lat || !d.lon) return;
+            const stepKey = `${d.cid}:${d.blockIdx}:${d.dir}`;
+            if (!activeStepSet.has(stepKey)) return;
+            let bestIdx = -1;
+            let bestDist = Infinity;
+            for (let i = 0; i < fullTrackPts.length; i++) {
+              const pt = fullTrackPts[i];
+              if (pt.cid === d.cid && pt.blockIdx === d.blockIdx) {
+                const dist = haversineKm(d.lat, d.lon, pt.lat, pt.lon);
+                if (dist < bestDist) {
+                  bestDist = dist;
+                  bestIdx = i;
+                }
+              }
+            }
+            if (bestIdx !== -1 && bestDist <= 1.2) {
+              routeSignals.push({ item, routeIdx: bestIdx, cumKm: cumDist[bestIdx] || 0 });
+            }
+          });
+          routeSignals.sort((a, b) => a.routeIdx - b.routeIdx);
+        }
+
+        activeCustomRoute = {
+          fromSt,
+          toSt,
+          stations: solved.stations,
+          cids: activeCids,
+          trackPts: fullTrackPts,
+          cumDist,
+          routeStations,
+          routeLcs,
+          routeBridges,
+          routeSignals,
+          totalKm
+        };
+
+        if (fullTrackPts.length >= 2) {
+          const latlngs = fullTrackPts.map(p => [p.lat, p.lon]);
+          L.polyline(latlngs, {
+            pane: "selectedRoutePane",
+            color: "#38bdf8",
+            weight: 8,
+            opacity: 0.28,
+            lineCap: "round",
+            lineJoin: "round",
+            interactive: false
+          }).addTo(selectedRouteHighlightLayer);
+
+          const startPt = stationCoords[fromSt];
+          const endPt = stationCoords[toSt];
+
+          L.marker([startPt.lat, startPt.lon], {
+            pane: "selectedRoutePane",
+            icon: L.divIcon({
+              className: "",
+              html: `<div class="endpoint-pin-badge" style="background:#059669;">SRC: ${fromSt}</div>`,
+              iconSize: [74, 22],
+              iconAnchor: [37, 28]
+            }),
+            interactive: false
+          }).addTo(selectedRouteHighlightLayer);
+
+          L.marker([endPt.lat, endPt.lon], {
+            pane: "selectedRoutePane",
+            icon: L.divIcon({
+              className: "",
+              html: `<div class="endpoint-pin-badge" style="background:#d97706;">DST: ${toSt}</div>`,
+              iconSize: [74, 22],
+              iconAnchor: [37, 28]
+            }),
+            interactive: false
+          }).addTo(selectedRouteHighlightLayer);
+
+          if (fitMapToRoute) {
+            map.fitBounds(L.latLngBounds(latlngs), { padding: [45, 45] });
+          }
+        }
+
+        document.getElementById("routeStationsCountText").textContent =
+          `${fromSt} → ${toSt} (${solved.stations.length} Stns)`;
+        document.getElementById("routeDistanceText").textContent =
+          `${totalKm.toFixed(1)} km`;
+        document.getElementById("liveRemainDistValue").textContent =
+          `${totalKm.toFixed(1)} km`;
+
+        if (document.getElementById("isolateRouteToggle").checked && activeCids.size > 0) {
+          corridors.forEach(c => {
+            const state = corridorLayers[c.id];
+            state.visible = activeCids.has(c.id);
+            if (state.visible) state.layer.addTo(map);
+            else map.removeLayer(state.layer);
+          });
+          renderLineFilters();
+        }
+      }
+
+      // Persistent Storage v8
+      const CACHE_KEY = "solapur_real_rail_strict_v10";
+      const IDB_NAME = "SolapurRealTrackStrictDB_v10";
+      const IDB_STORE = "real_tracks_v10";
+
+      function saveRealTrackCache(waysList) {
+        try {
+          localStorage.setItem(CACHE_KEY, JSON.stringify(waysList));
+        } catch (e) {}
+        try {
+          const req = indexedDB.open(IDB_NAME, 1);
+          req.onupgradeneeded = e => {
+            const db = e.target.result;
+            if (!db.objectStoreNames.contains(IDB_STORE)) {
+              db.createObjectStore(IDB_STORE);
+            }
+          };
+          req.onsuccess = e => {
+            const db = e.target.result;
+            const tx = db.transaction(IDB_STORE, "readwrite");
+            tx.objectStore(IDB_STORE).put(waysList, CACHE_KEY);
+          };
+        } catch (e) {}
+      }
+
+      function loadRealTrackFromLocalStorage() {
+        try {
+          const raw = localStorage.getItem(CACHE_KEY);
+          if (!raw) return null;
+          const parsed = JSON.parse(raw);
+          return Array.isArray(parsed) && parsed.length > 0 ? parsed : null;
+        } catch (e) {
+          return null;
+        }
+      }
+
+      function loadRealTrackFromIndexedDB() {
+        return new Promise(resolve => {
+          try {
+            const req = indexedDB.open(IDB_NAME, 1);
+            req.onupgradeneeded = e => {
+              const db = e.target.result;
+              if (!db.objectStoreNames.contains(IDB_STORE)) {
+                db.createObjectStore(IDB_STORE);
+              }
+            };
+            req.onsuccess = e => {
+              try {
+                const db = e.target.result;
+                const tx = db.transaction(IDB_STORE, "readonly");
+                const getReq = tx.objectStore(IDB_STORE).get(CACHE_KEY);
+                getReq.onsuccess = () => {
+                  const res = getReq.result;
+                  resolve(Array.isArray(res) && res.length > 0 ? res : null);
+                };
+                getReq.onerror = () => resolve(null);
+              } catch (err) {
+                resolve(null);
+              }
+            };
+            req.onerror = () => resolve(null);
+          } catch (e) {
+            resolve(null);
+          }
+        });
+      }
+
+      function markTrackConnectedUI(segmentCount) {
+        const dot = document.getElementById("trackStatusDot");
+        const text = document.getElementById("trackStatusText");
+        const retryBtn = document.getElementById("retryTrackBtn");
+        const pill = document.getElementById("trackStatusPill");
+
+        dot.className = "w-2.5 h-2.5 rounded-full bg-emerald-400 shadow-[0_0_8px_#34d399]";
+        text.textContent = `Real railway track loaded (${segmentCount} segments)`;
+        pill.className = "absolute top-3 left-14 z-[1000] bg-slate-900/95 backdrop-blur-md border border-emerald-500/50 text-slate-100 text-[11px] px-3 py-1.5 rounded-full shadow-lg flex items-center gap-2";
+        retryBtn.classList.add("hidden");
+
+        if (typeof snapSignalsToTracks === "function") snapSignalsToTracks();
+        buildSelectedRouteFromStations(fromStationSelect.value, toStationSelect.value, false);
+
+        if (lastLiveFix) {
+          updateLivePosition(lastLiveFix.lat, lastLiveFix.lon, lastLiveFix.accuracyMeters, lastLiveFix.speedKmh, lastLiveFix.sourceLabel, lastLiveFix.lockedCid);
+        } else {
+          const st = fromStationSelect.value || "SUR";
+          updateLivePosition(stationCoords[st].lat, stationCoords[st].lon, 4, 0, `Source (${st})`, null);
+        }
+      }
+
+      let autoReconnectTimer = null;
+
+      async function fetchOverpassFromMirror(url, query, timeoutMs) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+          const resp = await fetch(url + "?data=" + encodeURIComponent(query), {
+            method: "GET",
+            signal: controller.signal
+          });
+          clearTimeout(timer);
+          if (!resp.ok) throw new Error("HTTP " + resp.status);
+          const json = await resp.json();
+          if (!json || !Array.isArray(json.elements) || json.elements.length === 0) {
+            throw new Error("Empty elements");
+          }
+          return json;
+        } catch (err) {
+          clearTimeout(timer);
+          throw err;
+        }
+      }
+
+      async function loadRealRailwayTracks(forceNetwork) {
+        const dot = document.getElementById("trackStatusDot");
+        const text = document.getElementById("trackStatusText");
+        const retryBtn = document.getElementById("retryTrackBtn");
+
+        if (autoReconnectTimer) {
+          clearTimeout(autoReconnectTimer);
+          autoReconnectTimer = null;
+        }
+
+        if (!forceNetwork) {
+          const cachedLocal = loadRealTrackFromLocalStorage();
+          if (cachedLocal) {
+            const count = renderRealTrackWays(cachedLocal);
+            if (count > 0) {
+              markTrackConnectedUI(count);
+              return;
+            }
+          }
+          const cachedIdb = await loadRealTrackFromIndexedDB();
+          if (cachedIdb) {
+            const count = renderRealTrackWays(cachedIdb);
+            if (count > 0) {
+              markTrackConnectedUI(count);
+              return;
+            }
+          }
+        }
+
+        dot.className = "w-2.5 h-2.5 rounded-full bg-amber-400 animate-pulse";
+        text.textContent = "Loading real railway track geometry...";
+        retryBtn.classList.add("hidden");
+
+        const query = `[out:json][timeout:25];way["railway"="rail"][!"service"](16.75,74.50,18.60,77.10);out geom;`;
+        const endpoints = [
+          "https://overpass-api.de/api/interpreter",
+          "https://overpass.kumi.systems/api/interpreter",
+          "https://overpass.private.coffee/api/interpreter",
+          "https://maps.mail.ru/osm/tools/overpass/api/interpreter"
+        ];
+
+        let data = null;
+        try {
+          data = await Promise.any(endpoints.map(url => fetchOverpassFromMirror(url, query, 18000)));
+        } catch (err) {
+          data = null;
+        }
+
+        if (!data) {
+          dot.className = "w-2.5 h-2.5 rounded-full bg-amber-400 animate-pulse";
+          text.textContent = "Reconnecting to real railway track server...";
+          retryBtn.classList.remove("hidden");
+          autoReconnectTimer = setTimeout(() => loadRealRailwayTracks(true), 3500);
+          return;
+        }
+
+        const clippedWays = [];
+        data.elements.forEach(el => {
+          if (el.type !== "way" || !Array.isArray(el.geometry) || el.geometry.length < 2) return;
+          const pieces = matchAndClipWay(el.geometry);
+          for (let i = 0; i < pieces.length; i++) {
+            clippedWays.push(pieces[i]);
+          }
+        });
+
+        const matchedCount = renderRealTrackWays(clippedWays);
+        if (matchedCount === 0) {
+          dot.className = "w-2.5 h-2.5 rounded-full bg-amber-400 animate-pulse";
+          text.textContent = "Reconnecting to real railway track server...";
+          retryBtn.classList.remove("hidden");
+          autoReconnectTimer = setTimeout(() => loadRealRailwayTracks(true), 3500);
+          return;
+        }
+
+        saveRealTrackCache(clippedWays);
+        markTrackConnectedUI(matchedCount);
+      }
+
+      document.getElementById("retryTrackBtn").addEventListener("click", () => loadRealRailwayTracks(true));
+
+      // Draw Stations
+      const stationMarkersByCode = {};
+      Object.keys(stationCoords).forEach(code => {
+        const pt = stationCoords[code];
+        const meta = stationMeta[code] || { km: "", type: "Station", facilities: "", line: "" };
+        const isJunction = junctionStations.has(code) || meta.type === "Junction";
+        const color = stationColorMap[code] || "#3b82f6";
+
+        const marker = L.circleMarker([pt.lat, pt.lon], {
+          pane: "stationPane",
+          radius: isJunction ? 8 : 5.5,
+          fillColor: color,
+          color: "#ffffff",
+          weight: isJunction ? 2.5 : 2,
+          opacity: 1,
+          fillOpacity: 1
+        }).addTo(stationsLayer);
+
+        stationMarkersByCode[code] = marker;
+
+        const typeBadge = isJunction
+          ? '<span style="display:inline-block;background:#dbeafe;color:#1e40af;font-size:10px;font-weight:700;padding:1px 6px;border-radius:999px;margin-left:6px;">Junction</span>'
+          : (meta.type === "Cabin" ? '<span style="display:inline-block;background:#fef3c7;color:#92400e;font-size:10px;font-weight:700;padding:1px 6px;border-radius:999px;margin-left:6px;">Cabin</span>' : '');
+
+        const kmRow = meta.km !== "" ? `<div><strong>Km:</strong> ${meta.km}</div>` : "";
+        const lineRow = meta.line ? `<div><strong>Track:</strong> ${meta.line}</div>` : "";
+        const facRow = meta.facilities ? `<div><strong>Facilities:</strong> ${meta.facilities}</div>` : "";
+
+        marker.bindPopup(
+          `<div style="min-width:205px;font-size:11px;color:#334155;">
+            <div style="display:flex;align-items:center;margin-bottom:5px;">
+              <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${color};margin-right:6px;"></span>
+              <strong style="font-size:14px;color:#0f172a;">${code}</strong>${typeBadge}
+            </div>
+            ${kmRow}${lineRow}${facRow}
+            <div style="margin-top:4px;color:#64748b;font-family:monospace;">
+              ${pt.lat.toFixed(6)}, ${pt.lon.toFixed(6)}
+            </div>
+            <div style="margin-top:8px;display:flex;gap:6px;">
+              <button type="button" data-set-from="${code}" style="flex:1;background:#059669;color:#fff;border:none;border-radius:6px;padding:4px 6px;font-size:10px;font-weight:700;cursor:pointer;">Set Source</button>
+              <button type="button" data-set-to="${code}" style="flex:1;background:#d97706;color:#fff;border:none;border-radius:6px;padding:4px 6px;font-size:10px;font-weight:700;cursor:pointer;">Set Dest</button>
+            </div>
+          </div>`
+        );
+
+        const labelTooltip = L.tooltip({
+          permanent: true, direction: "top", offset: [0, -7], className: "station-label-tooltip"
+        }).setLatLng([pt.lat, pt.lon]).setContent(code);
+        labelTooltip.addTo(labelsLayer);
+
+        searchableItems.push({ label: code, sub: meta.type || "Station", lat: pt.lat, lon: pt.lon, marker: marker });
+      });
+
+      document.addEventListener("click", e => {
+        const fromBtn = e.target.closest("[data-set-from]");
+        if (fromBtn) {
+          const st = fromBtn.getAttribute("data-set-from");
+          fromStationSelect.value = st;
+          document.getElementById("simCorridorSelect").value = "custom";
+          onCustomStationRouteChange(true);
+          map.closePopup();
+          showToast(`Source set to ${st} (${st} → ${toStationSelect.value})`);
+          return;
+        }
+        const toBtn = e.target.closest("[data-set-to]");
+        if (toBtn) {
+          const st = toBtn.getAttribute("data-set-to");
+          toStationSelect.value = st;
+          document.getElementById("simCorridorSelect").value = "custom";
+          onCustomStationRouteChange(true);
+          map.closePopup();
+          showToast(`Destination set to ${st} (${fromStationSelect.value} → ${st})`);
+        }
+      });
+
+      // Draw Bridges
+      const bridgeMarkers = [];
+      bridges.forEach(br => {
+        const icon = L.divIcon({
+          className: "",
+          html: '<div class="bridge-marker-icon">B</div>',
+          iconSize: [20, 20],
+          iconAnchor: [10, 10]
+        });
+        const marker = L.marker([br.lat, br.lon], { pane: "bridgePane", icon: icon }).addTo(bridgesLayer);
+        marker.bindPopup(
+          `<div style="min-width:180px;font-size:11px;color:#334155;">
+            <div style="font-size:13px;font-weight:700;color:#0369a1;margin-bottom:3px;">${br.name}</div>
+            <div><strong>Km:</strong> ${br.km}</div>
+            <div><strong>Track:</strong> ${br.line}</div>
+            <div style="margin-top:4px;color:#64748b;font-family:monospace;">${br.lat.toFixed(6)}, ${br.lon.toFixed(6)}</div>
+          </div>`
+        );
+        bridgeMarkers.push({ data: br, marker });
+        searchableItems.push({ label: br.name, sub: `Bridge · Km ${br.km}`, lat: br.lat, lon: br.lon, marker: marker });
+      });
+
+      // Draw Level Crossings
+      const lcMarkers = [];
+      levelCrossings.forEach(lc => {
+        const icon = L.divIcon({
+          className: "",
+          html: '<div class="lc-marker-icon"><span>X</span></div>',
+          iconSize: [18, 18],
+          iconAnchor: [9, 9]
+        });
+
+        const marker = L.marker([lc.lat, lc.lon], { pane: "lcPane", icon: icon }).addTo(lcsLayer);
+        marker.bindPopup(
+          `<div style="min-width:190px;font-size:11px;color:#334155;">
+            <div style="font-size:13px;font-weight:700;color:#991b1b;margin-bottom:3px;">${lc.name}</div>
+            <div><strong>Controlled by:</strong> ${lc.station}</div>
+            ${lc.km ? `<div><strong>Km:</strong> ${lc.km}</div>` : ""}
+            ${lc.dept ? `<div><strong>Dept:</strong> ${lc.dept}</div>` : ""}
+            ${lc.status ? `<div><strong>Status:</strong> ${lc.status}</div>` : ""}
+            ${lc.op ? `<div><strong>Operated by:</strong> ${lc.op}</div>` : ""}
+            <div style="margin-top:4px;color:#64748b;font-family:monospace;">
+              ${lc.lat.toFixed(6)}, ${lc.lon.toFixed(6)}
+            </div>
+          </div>`
+        );
+        allBounds.extend([lc.lat, lc.lon]);
+        lcMarkers.push({ data: lc, marker });
+        searchableItems.push({ label: `${lc.name} (${lc.station})`, sub: "Level Crossing", lat: lc.lat, lon: lc.lon, marker: marker });
+      });
+
+      // Build effective KM ranges per corridor block for accurate signal snapping
+      const sigEndpointKmOverride = { "DD": 267.5, "MRJ": 563.5, "GANI": 561.7, "TJSP": 579.85 };
+      const effCorridorSegKms = {};
+      corridors.forEach(c => {
+        const orderedNames = c.id === "c6"
+          ? ["KWV", "CNHL", "MGO", "SEI", "UPI", "BTW", "KCB", "PJR", "DRSV", "YSI", "KRMD", "DKY", "TER", "PCP", "MRX", "NEI", "OSA", "HGL", "LUR", "BANL", "GANI"]
+          : c.stations.slice();
+        const kms = orderedNames.map(st => {
+          if (sigEndpointKmOverride[st] !== undefined) return sigEndpointKmOverride[st];
+          return (stationMeta[st] && stationMeta[st].km !== "") ? Number(stationMeta[st].km) : null;
+        });
+        let lastIdx = -1;
+        for (let i = 0; i < kms.length; i++) {
+          if (kms[i] !== null) {
+            if (lastIdx === -1 && i > 0) {
+              for (let j = 0; j < i; j++) kms[j] = kms[i];
+            } else if (lastIdx !== -1 && i > lastIdx + 1) {
+              const sK = kms[lastIdx], eK = kms[i];
+              for (let j = lastIdx + 1; j < i; j++) {
+                kms[j] = sK + (eK - sK) * ((j - lastIdx) / (i - lastIdx));
+              }
+            }
+            lastIdx = i;
+          }
+        }
+        const segKms = [];
+        for (let i = 0; i < orderedNames.length - 1; i++) {
+          segKms.push({ kmA: kms[i] || 0, kmB: kms[i + 1] || 0 });
+        }
+        effCorridorSegKms[c.id] = segKms;
+      });
+
+      const signalMarkers = [];
+      signalsData.forEach(sig => {
+        const isSpecial = /neutral|bridge/i.test(sig.name) || /neutral|bridge/i.test(sig.rem);
+        const isRhs = sig.side === "RHS";
+        const fillCol = isSpecial ? "#a855f7" : (isRhs ? "#f97316" : "#22c55e");
+        const marker = L.circleMarker([17.75, 75.75], {
+          pane: "signalPane",
+          radius: isSpecial || isRhs ? 4.5 : 3.8,
+          color: "#ffffff",
+          weight: 1,
+          fillColor: fillCol,
+          fillOpacity: 0.92
+        }).addTo(signalsLayer);
+
+        const sideBadge = sig.side ? `<span style="background:${isRhs ? "#ea580c" : "#059669"};color:#fff;padding:1px 5px;border-radius:4px;font-weight:700;font-size:10px;">${sig.side}</span>` : "";
+        const remHtml = sig.rem ? `<div><strong>Remarks:</strong> <span style="color:#b45309;font-weight:600;">${sig.rem}</span></div>` : "";
+        marker.bindPopup(`
+          <div style="min-width:195px;font-size:11px;color:#1e293b;">
+            <div style="font-weight:800;font-size:13px;color:${fillCol === "#22c55e" ? "#15803d" : fillCol};margin-bottom:3px;">
+              Signal: ${sig.name} ${sideBadge}
+            </div>
+            <div><strong>Section:</strong> ${sig.sec} (Sr. ${sig.sr})</div>
+            <div><strong>Station / Block:</strong> ${sig.st}</div>
+            <div><strong>KM No.:</strong> ${sig.mast}</div>
+            ${remHtml}
+          </div>
+        `);
+
+        const item = { data: sig, marker };
+        signalMarkers.push(item);
+        searchableItems.push({
+          label: `Sig: ${sig.name} · ${sig.st} (${sig.mast})`,
+          sub: `${sig.sec}${sig.side ? " · " + sig.side : ""}`,
+          get lat() { return sig.lat || 17.75; },
+          get lon() { return sig.lon || 75.75; },
+          marker: marker
+        });
+      });
+
+      function snapSignalsToTracks() {
+        signalsData.forEach(sig => {
+          const cObj = corridorMap[sig.cid];
+          const segKms = effCorridorSegKms[sig.cid];
+          if (!cObj || !segKms || segKms.length === 0) return;
+
+          let bestBIdx = 0;
+          let bestDist = Infinity;
+          for (let i = 0; i < segKms.length; i++) {
+            const minK = Math.min(segKms[i].kmA, segKms[i].kmB);
+            const maxK = Math.max(segKms[i].kmA, segKms[i].kmB);
+            if (sig.km >= minK && sig.km <= maxK) {
+              bestBIdx = i;
+              bestDist = 0;
+              break;
+            }
+            const d = Math.min(Math.abs(sig.km - minK), Math.abs(sig.km - maxK));
+            if (d < bestDist) {
+              bestDist = d;
+              bestBIdx = i;
+            }
+          }
+
+          const { kmA, kmB } = segKms[bestBIdx];
+          const t = (kmB === kmA) ? 0.5 : Math.max(0, Math.min(1, (sig.km - kmA) / (kmB - kmA)));
+          const realPts = blockRealTrackPoints[`${sig.cid}:${bestBIdx}`];
+
+          let lat, lon;
+          if (realPts && realPts.length >= 2) {
+            const cum = [0];
+            for (let i = 1; i < realPts.length; i++) {
+              cum.push(cum[i - 1] + haversineKm(realPts[i - 1].lat, realPts[i - 1].lon, realPts[i].lat, realPts[i].lon));
+            }
+            const totalD = cum[cum.length - 1];
+            const targetD = t * totalD;
+            let segI = 0;
+            while (segI < cum.length - 2 && cum[segI + 1] < targetD) segI++;
+            const segLen = cum[segI + 1] - cum[segI];
+            const localT = segLen > 0 ? (targetD - cum[segI]) / segLen : 0;
+            lat = realPts[segI].lat + (realPts[segI + 1].lat - realPts[segI].lat) * localT;
+            lon = realPts[segI].lon + (realPts[segI + 1].lon - realPts[segI].lon) * localT;
+          } else {
+            const s = cObj.segs[bestBIdx];
+            lat = s[0] + (s[2] - s[0]) * t;
+            lon = s[1] + (s[3] - s[1]) * t;
+          }
+
+          // Snap strictly onto the rendered OSM real-track geometry for this corridor
+          const realSegs = realTrackSegmentsByCorridor[sig.cid];
+          if (realSegs && realSegs.length > 0) {
+            let bestRealDistSq = Infinity;
+            let snappedLat = lat;
+            let snappedLon = lon;
+            for (let i = 0; i < realSegs.length; i++) {
+              const rs = realSegs[i];
+              const proj = projectOnSegment(lat, lon, rs.ax, rs.ay, rs.bx, rs.by);
+              if (proj.distSq < bestRealDistSq) {
+                bestRealDistSq = proj.distSq;
+                snappedLat = proj.lat;
+                snappedLon = proj.lon;
+              }
+            }
+            if (bestRealDistSq < 0.002) {
+              lat = snappedLat;
+              lon = snappedLon;
+            }
+          }
+
+          sig.blockIdx = bestBIdx;
+          sig.lat = lat;
+          sig.lon = lon;
+        });
+
+        signalMarkers.forEach(item => {
+          if (item.data.lat && item.data.lon) {
+            item.marker.setLatLng([item.data.lat, item.data.lon]);
+          }
+        });
+      }
+      snapSignalsToTracks();
+
+      // Draw Boundaries
+      boundaries.forEach(b => {
+        const icon = L.divIcon({
+          className: "",
+          html: '<div class="boundary-marker-icon">D</div>',
+          iconSize: [22, 22],
+          iconAnchor: [11, 11]
+        });
+
+        const marker = L.marker([b.lat, b.lon], { pane: "boundaryPane", icon: icon }).addTo(boundariesLayer);
+        marker.bindPopup(
+          `<div style="min-width:195px;font-size:11px;color:#334155;">
+            <div style="font-size:13px;font-weight:700;color:#dc2626;margin-bottom:3px;">${b.name}</div>
+            <div><strong>Km:</strong> ${b.km}</div>
+            <div><strong>Track:</strong> ${b.line}</div>
+            <div style="margin-top:4px;color:#64748b;font-family:monospace;">
+              ${b.lat.toFixed(6)}, ${b.lon.toFixed(6)}
+            </div>
+          </div>`
+        );
+        allBounds.extend([b.lat, b.lon]);
+        searchableItems.push({ label: b.name, sub: "Boundary", lat: b.lat, lon: b.lon, marker: marker });
+      });
+
+      // =========================================================================
+      // OFFICIAL LIVE LOCATION, FREE ROUTE SIMULATOR & TELEMETRY ENGINE
+      // =========================================================================
+      let watchId = null;
+      let pinInspectMode = false;
+      let simTimer = null;
+      let simIndex = 0;
+      let lastLiveFix = null;
+      const trailPoints = [];
+
+      const liveBeaconIcon = L.divIcon({
+        className: "",
+        html: '<div class="live-gps-wrapper"><div class="live-gps-pulse"></div><div class="live-gps-core"></div></div>',
+        iconSize: [36, 36],
+        iconAnchor: [18, 18]
+      });
+
+      const snappedTrackIcon = L.divIcon({
+        className: "",
+        html: '<div class="snapped-track-dot" title="Snapped Point on Real Railway Track"></div>',
+        iconSize: [12, 12],
+        iconAnchor: [6, 6]
+      });
+
+      let liveMarker = null;
+      let accuracyCircle = null;
+      let snappedMarker = null;
+      let snapConnectorLine = null;
+      const trailPolyline = L.polyline([], {
+        pane: "liveGpsPane",
+        color: "#10b981",
+        weight: 3.5,
+        dashArray: "4, 6",
+        opacity: 0.9
+      }).addTo(liveGpsLayer);
+
+      let currentNextSignalTarget = null;
+      let announcedSignalStages = {};
+      let currentSpokenSigKey = null;
+      let preferredVoice = null;
+      const SIGNAL_TTS_THRESHOLDS = [
+        { km: 1.0, label: "1 K M" },
+        { km: 0.5, label: "500 meters" }
+      ];
+
+      function selectPreferredVoice() {
+        if (!("speechSynthesis" in window)) return;
+        const voices = window.speechSynthesis.getVoices() || [];
+        preferredVoice =
+          voices.find(v => v.lang && v.lang.toLowerCase().startsWith("en-in") && v.localService) ||
+          voices.find(v => v.lang && v.lang.toLowerCase().startsWith("en") && v.localService) ||
+          voices.find(v => v.lang && v.lang.toLowerCase().startsWith("en")) ||
+          null;
+      }
+      if ("speechSynthesis" in window) {
+        selectPreferredVoice();
+        window.speechSynthesis.onvoiceschanged = selectPreferredVoice;
+      }
+
+      function speakSignalCallout(text, sigKey) {
+        const ttsBox = document.getElementById("ttsToggle");
+        if (!ttsBox || !ttsBox.checked || !("speechSynthesis" in window)) return;
+        try {
+          // If we already moved on to a NEW signal, drop the stale passed signal immediately
+          if (window.speechSynthesis.speaking || window.speechSynthesis.pending) {
+            if (sigKey !== currentSpokenSigKey) {
+              window.speechSynthesis.cancel();
+            } else {
+              return;
+            }
+          }
+          if (!preferredVoice) selectPreferredVoice();
+          const utter = new SpeechSynthesisUtterance(text);
+          if (preferredVoice) utter.voice = preferredVoice;
+          utter.lang = preferredVoice ? preferredVoice.lang : "en-IN";
+          utter.rate = 1.12;
+          utter.pitch = 1.0;
+          utter.volume = 0.95;
+          currentSpokenSigKey = sigKey;
+          window.speechSynthesis.speak(utter);
+        } catch (e) {}
+      }
+
+      // Driver Cab Master Controller: Reverser (F / N / R) & 8 Notches
+      const CAB_NOTCH_SPEEDS = [0, 20, 40, 65, 90, 115, 140, 160, 180];
+      let currentSimSpeedKmh = 0;
+      let cabReverser = "F"; // "F" (Forward), "N" (Neutral), "R" (Reverse)
+      let cabNotch = 4;      // 0 (Idle) .. 8
+      let cabBrakeApplied = false;
+      let autoBrakeEngaged = false;
+
+      function setCabBrake(applied, isAuto) {
+        cabBrakeApplied = applied;
+        autoBrakeEngaged = applied && !!isAuto;
+        const btn = document.getElementById("cabBrakeBtn");
+        if (btn) {
+          if (applied) {
+            btn.textContent = autoBrakeEngaged ? "AUTO" : "BRK ON";
+            btn.className = "px-1.5 py-0.5 rounded text-[9px] font-bold bg-rose-600 border border-rose-400 text-white cursor-pointer shrink-0 transition animate-pulse";
+          } else {
+            btn.textContent = "BRK";
+            btn.className = "px-1.5 py-0.5 rounded text-[9px] font-bold bg-slate-800 border border-rose-500/40 text-rose-300 hover:bg-rose-600/30 cursor-pointer shrink-0 transition";
+          }
+        }
+        updateCabReadout();
+      }
+
+      function setCabReverser(dir) {
+        cabReverser = dir;
+        const fBtn = document.getElementById("revFBtn");
+        const nBtn = document.getElementById("revNBtn");
+        const rBtn = document.getElementById("revRBtn");
+        const base = "px-1.5 py-0.5 rounded text-[10px] font-bold cursor-pointer transition ";
+        fBtn.className = base + (dir === "F" ? "bg-emerald-600 text-white" : "text-slate-400 hover:text-white");
+        nBtn.className = base + (dir === "N" ? "bg-amber-600 text-white" : "text-slate-400 hover:text-white");
+        rBtn.className = base + (dir === "R" ? "bg-rose-600 text-white" : "text-slate-400 hover:text-white");
+        updateCabReadout();
+      }
+
+      function setCabNotch(n) {
+        cabNotch = Math.max(0, Math.min(8, Number(n) || 0));
+        if (cabNotch > 0 && cabBrakeApplied && !autoBrakeEngaged) setCabBrake(false, false);
+        document.querySelectorAll(".notch-btn").forEach(btn => {
+          const bn = Number(btn.getAttribute("data-notch"));
+          if (bn === cabNotch) {
+            btn.className = "notch-btn px-1.5 py-0.5 rounded text-[9px] font-bold cursor-pointer " +
+              (bn === 0 ? "bg-slate-600 text-white" : (bn >= 7 ? "bg-rose-600 text-white" : "bg-emerald-600 text-white"));
+          } else if (bn > 0 && bn < cabNotch) {
+            btn.className = "notch-btn px-1.5 py-0.5 rounded text-[9px] font-bold cursor-pointer bg-emerald-950 text-emerald-300";
+          } else {
+            btn.className = "notch-btn px-1.5 py-0.5 rounded text-[9px] font-bold cursor-pointer bg-slate-800 text-slate-400 hover:text-white";
+          }
+        });
+        updateCabReadout();
+      }
+
+      function updateCabReadout() {
+        const el = document.getElementById("cabNotchReadout");
+        if (!el) return;
+        const spd = getActiveSimSpeedKmh();
+        el.textContent = cabReverser === "N" ? "NEU · 0" : `${cabReverser}·N${cabNotch} · ${spd}`;
+        el.className = "text-[10px] font-mono font-bold shrink-0 " +
+          (cabReverser === "N" ? "text-amber-300" : (cabReverser === "R" ? "text-rose-300" : "text-emerald-300"));
+      }
+
+      function getSimMultiplier() {
+        const el = document.getElementById("simMultiplierSelect");
+        return el ? (Number(el.value) || 1) : 1;
+      }
+
+      function getActiveSimSpeedKmh() {
+        if (cabBrakeApplied || cabReverser === "N") return 0;
+        return CAB_NOTCH_SPEEDS[cabNotch] || 0;
+      }
+      let currentNextStationTarget = stationMarkersByCode["BALE"] || stationMarkersByCode["SUR"];
+      let currentNextLcTarget = lcMarkers[0] ? lcMarkers[0].marker : null;
+      let currentNextBridgeTarget = bridgeMarkers[0] ? bridgeMarkers[0].marker : null;
+
+      function computeRouteTelemetry(lat, lon, lockedCid, simRemainKm, explicitRouteIdx) {
+        let snappedLat = lat;
+        let snappedLon = lon;
+        let bestCorridorId = lockedCid || "c3";
+
+        const candidateCorridorIds = lockedCid
+          ? [lockedCid]
+          : (activeCustomRoute && activeCustomRoute.cids && activeCustomRoute.cids.size > 0
+              ? Array.from(activeCustomRoute.cids)
+              : corridors.filter(c => corridorLayers[c.id].visible).map(c => c.id));
+
+        if (candidateCorridorIds.length === 0) candidateCorridorIds.push("c3");
+
+        let minRealDistSq = Infinity;
+        for (let cIdx = 0; cIdx < candidateCorridorIds.length; cIdx++) {
+          const cid = candidateCorridorIds[cIdx];
+          const segList = realTrackSegmentsByCorridor[cid] || [];
+          for (let i = 0; i < segList.length; i++) {
+            const seg = segList[i];
+            const proj = projectOnSegment(lat, lon, seg.ax, seg.ay, seg.bx, seg.by);
+            if (proj.distSq < minRealDistSq) {
+              minRealDistSq = proj.distSq;
+              snappedLat = proj.lat;
+              snappedLon = proj.lon;
+              bestCorridorId = cid;
+            }
+          }
+        }
+
+        const bestCorridor = corridorMap[bestCorridorId] || corridorGeometries[2];
+        let bestBlockSeg = bestCorridor.segs[0];
+        let bestBlockProj = { t: 0, distSq: Infinity };
+
+        for (const s of bestCorridor.segs) {
+          const proj = projectOnSegment(snappedLat, snappedLon, s[0], s[1], s[2], s[3]);
+          if (proj.distSq < bestBlockProj.distSq) {
+            bestBlockProj = proj;
+            bestBlockSeg = s;
+          }
+        }
+
+        const offsetKm = haversineKm(lat, lon, snappedLat, snappedLon);
+        const offsetMeters = Math.round(offsetKm * 1000);
+        const interpolatedKm = bestBlockSeg[4] + (bestBlockSeg[5] - bestBlockSeg[4]) * bestBlockProj.t;
+
+        const stA = bestBlockSeg[6];
+        const stB = bestBlockSeg[7];
+        const distA = haversineKm(snappedLat, snappedLon, bestBlockSeg[0], bestBlockSeg[1]);
+        const distB = haversineKm(snappedLat, snappedLon, bestBlockSeg[2], bestBlockSeg[3]);
+
+        const destSt = toStationSelect.value || "KWV";
+        const destCoord = stationCoords[destSt] || stationCoords["KWV"];
+
+        // Determine current index along activeCustomRoute.trackPts
+        let curRouteIdx = 0;
+        const rPts = activeCustomRoute && activeCustomRoute.trackPts ? activeCustomRoute.trackPts : [];
+        if (explicitRouteIdx !== null && explicitRouteIdx !== undefined) {
+          curRouteIdx = explicitRouteIdx;
+        } else if (rPts.length > 0) {
+          let bestD = Infinity;
+          for (let i = 0; i < rPts.length; i++) {
+            const d = (rPts[i].lat - snappedLat) * (rPts[i].lat - snappedLat) + (rPts[i].lon - snappedLon) * (rPts[i].lon - snappedLon);
+            if (d < bestD) {
+              bestD = d;
+              curRouteIdx = i;
+            }
+          }
+        }
+
+        const curCumKm = activeCustomRoute && activeCustomRoute.cumDist && activeCustomRoute.cumDist.length > curRouteIdx
+          ? activeCustomRoute.cumDist[curRouteIdx]
+          : 0;
+        const remainToDestKm = (simRemainKm !== null && simRemainKm !== undefined)
+          ? simRemainKm
+          : (activeCustomRoute && activeCustomRoute.totalKm > 0
+              ? Math.max(0, activeCustomRoute.totalKm - curCumKm)
+              : haversineKm(snappedLat, snappedLon, destCoord.lat, destCoord.lon));
+
+        // 0. NEXT SIGNAL ahead along the route (Highest Priority)
+        let nextSigObj = null;
+        const rSignals = activeCustomRoute && activeCustomRoute.routeSignals ? activeCustomRoute.routeSignals : [];
+        for (let i = 0; i < rSignals.length; i++) {
+          if (rSignals[i].routeIdx > curRouteIdx) {
+            nextSigObj = {
+              item: rSignals[i].item,
+              distKm: Math.max(0, rSignals[i].cumKm - curCumKm)
+            };
+            break;
+          }
+        }
+
+        // 1. NEXT STATION ahead along the route
+        let nextStObj = null;
+        const rStations = activeCustomRoute && activeCustomRoute.routeStations ? activeCustomRoute.routeStations : [];
+        for (let i = 0; i < rStations.length; i++) {
+          if (rStations[i].routeIdx > curRouteIdx) {
+            nextStObj = {
+              code: rStations[i].code,
+              distKm: Math.max(0, rStations[i].cumKm - curCumKm)
+            };
+            break;
+          }
+        }
+        if (!nextStObj && rStations.length > 0) {
+          const lastSt = rStations[rStations.length - 1];
+          nextStObj = { code: lastSt.code, distKm: 0, arrived: true };
+        }
+
+        // 2. NEXT LC GATE ahead along the route
+        let nextLcObj = null;
+        const rLcs = activeCustomRoute && activeCustomRoute.routeLcs ? activeCustomRoute.routeLcs : [];
+        for (let i = 0; i < rLcs.length; i++) {
+          if (rLcs[i].routeIdx > curRouteIdx) {
+            nextLcObj = {
+              item: rLcs[i].item,
+              distKm: Math.max(0, rLcs[i].cumKm - curCumKm)
+            };
+            break;
+          }
+        }
+
+        // 3. NEXT BRIDGE ahead along the route
+        let nextBrObj = null;
+        const rBridges = activeCustomRoute && activeCustomRoute.routeBridges ? activeCustomRoute.routeBridges : [];
+        for (let i = 0; i < rBridges.length; i++) {
+          if (rBridges[i].routeIdx > curRouteIdx) {
+            nextBrObj = {
+              item: rBridges[i].item,
+              distKm: Math.max(0, rBridges[i].cumKm - curCumKm)
+            };
+            break;
+          }
+        }
+
+        return {
+          corridor: bestCorridor,
+          snappedLat,
+          snappedLon,
+          offsetMeters,
+          offsetKm,
+          interpolatedKm,
+          remainToDestKm,
+          destSt,
+          stA,
+          stB,
+          distA,
+          distB,
+          nextSigObj,
+          nextStObj,
+          nextLcObj,
+          nextBrObj
+        };
+      }
+
+      function updateLivePosition(lat, lon, accuracyMeters, speedKmh, sourceLabel, lockedCid, simRemainKm, explicitRouteIdx) {
+        const now = Date.now();
+        if ((speedKmh === null || speedKmh === undefined || isNaN(speedKmh)) && lastLiveFix) {
+          const dtHours = (now - lastLiveFix.time) / 3600000;
+          if (dtHours > 0.0001) {
+            const dKm = haversineKm(lastLiveFix.lat, lastLiveFix.lon, lat, lon);
+            speedKmh = Math.min(160, dKm / dtHours);
+          } else {
+            speedKmh = 0;
+          }
+        }
+        speedKmh = speedKmh || 0;
+        accuracyMeters = accuracyMeters || 5;
+
+        const tel = computeRouteTelemetry(lat, lon, lockedCid, simRemainKm, explicitRouteIdx);
+        lastLiveFix = { lat, lon, time: now, tel, speedKmh, accuracyMeters, sourceLabel, lockedCid };
+
+        if (!liveMarker) {
+          liveMarker = L.marker([lat, lon], { pane: "liveGpsPane", icon: liveBeaconIcon }).addTo(liveGpsLayer);
+          accuracyCircle = L.circle([lat, lon], {
+            pane: "liveGpsPane",
+            radius: Math.max(accuracyMeters, 25),
+            color: "#10b981",
+            weight: 1.5,
+            fillColor: "#10b981",
+            fillOpacity: 0.12
+          }).addTo(liveGpsLayer);
+          snappedMarker = L.marker([tel.snappedLat, tel.snappedLon], {
+            pane: "liveGpsPane",
+            icon: snappedTrackIcon
+          }).addTo(liveGpsLayer);
+          snapConnectorLine = L.polyline([[lat, lon], [tel.snappedLat, tel.snappedLon]], {
+            pane: "liveGpsPane",
+            color: "#f59e0b",
+            weight: 2,
+            dashArray: "3, 5",
+            opacity: 0.85
+          }).addTo(liveGpsLayer);
+        } else {
+          liveMarker.setLatLng([lat, lon]);
+          accuracyCircle.setLatLng([lat, lon]);
+          accuracyCircle.setRadius(Math.max(accuracyMeters, 25));
+          snappedMarker.setLatLng([tel.snappedLat, tel.snappedLon]);
+          snapConnectorLine.setLatLngs([[lat, lon], [tel.snappedLat, tel.snappedLon]]);
+        }
+
+        const nextSigPopup = tel.nextSigObj ? `${tel.nextSigObj.item.data.name} [${tel.nextSigObj.item.data.mast}] (${tel.nextSigObj.distKm.toFixed(2)} km)` : "N/A";
+        const nextStPopup = tel.nextStObj ? `${tel.nextStObj.code} (${tel.nextStObj.distKm.toFixed(2)} km)` : "N/A";
+        const popupHtml = `
+          <div style="min-width:215px;font-size:11px;color:#1e293b;">
+            <div style="font-weight:800;font-size:13px;color:#059669;margin-bottom:3px;">
+              Official Live Position (${sourceLabel})
+            </div>
+            <div><strong>Selected Route:</strong> ${fromStationSelect.value} → ${toStationSelect.value}</div>
+            <div><strong>Route Chainage:</strong> Km ${tel.interpolatedKm.toFixed(2)} (${tel.corridor.label})</div>
+            <div><strong>Block Section:</strong> ${tel.stA} ↔ ${tel.stB}</div>
+            <div><strong>Next Signal:</strong> ${nextSigPopup}</div>
+            <div><strong>Next Station:</strong> ${nextStPopup}</div>
+            <div><strong>To Destination (${tel.destSt}):</strong> ${tel.remainToDestKm.toFixed(1)} km</div>
+            <div><strong>Real Track Offset:</strong> ${tel.offsetMeters <= 999 ? tel.offsetMeters + " m" : tel.offsetKm.toFixed(2) + " km"}</div>
+            <div><strong>Speed / Acc:</strong> ${speedKmh.toFixed(1)} km/h · ±${Math.round(accuracyMeters)} m</div>
+            <div style="margin-top:4px;color:#64748b;font-family:monospace;">${lat.toFixed(6)}, ${lon.toFixed(6)}</div>
+          </div>
+        `;
+        liveMarker.bindPopup(popupHtml);
+
+        if (document.getElementById("recordTrailToggle").checked) {
+          trailPoints.push([lat, lon]);
+          if (trailPoints.length > 500) trailPoints.shift();
+          trailPolyline.setLatLngs(trailPoints);
+        }
+
+        if (document.getElementById("followGpsToggle").checked) {
+          map.panTo([lat, lon], { animate: true, duration: 0.45 });
+        }
+
+        document.getElementById("liveKmValue").textContent = `Km ${tel.interpolatedKm.toFixed(2)}`;
+        document.getElementById("liveCorridorBadge").textContent = `${fromStationSelect.value}→${toStationSelect.value}`;
+        document.getElementById("liveLineTypeValue").textContent = tel.corridor.doubleLine ? "Double" : "Single";
+        document.getElementById("liveSpeedValue").textContent = `${speedKmh.toFixed(1)} km/h`;
+        document.getElementById("liveRemainDistValue").textContent = `${tel.remainToDestKm.toFixed(1)} km`;
+        document.getElementById("liveAccuracyValue").textContent = `±${Math.round(accuracyMeters)} m`;
+
+        const offsetEl = document.getElementById("liveTrackOffset");
+        if (tel.offsetMeters <= 120) {
+          offsetEl.textContent = `On Track (${tel.offsetMeters} m)`;
+          offsetEl.className = "text-[10px] font-bold text-emerald-400";
+        } else if (tel.offsetMeters <= 1000) {
+          offsetEl.textContent = `Near Track (${tel.offsetMeters} m)`;
+          offsetEl.className = "text-[10px] font-bold text-amber-300";
+        } else {
+          offsetEl.textContent = `Off Route (${tel.offsetKm.toFixed(1)} km)`;
+          offsetEl.className = "text-[10px] font-bold text-rose-400";
+        }
+
+        document.getElementById("liveBlockSection").textContent =
+          `${tel.stA} (${tel.distA.toFixed(1)} km) ↔ ${tel.stB} (${tel.distB.toFixed(1)} km)`;
+
+        // Update NEXT Signal UI (Priority 1)
+        if (tel.nextSigObj) {
+          const sd = tel.nextSigObj.item.data;
+          const sideTxt = sd.side ? ` · ${sd.side}` : "";
+          const remTxt = sd.rem ? ` · ${sd.rem}` : "";
+          document.getElementById("nextSignalText").textContent =
+            `${sd.name} (${sd.st}) · Km ${sd.mast}${sideTxt}${remTxt} · ${tel.nextSigObj.distKm.toFixed(2)} km`;
+          currentNextSignalTarget = tel.nextSigObj.item.marker;
+
+          if (watchId !== null || simTimer !== null) {
+            const sigKey = `${sd.sr}:${sd.sec}:${sd.mast}`;
+            const distKm = tel.nextSigObj.distKm;
+            let bestStage = -1;
+            for (let sIdx = 0; sIdx < SIGNAL_TTS_THRESHOLDS.length; sIdx++) {
+              if (distKm <= SIGNAL_TTS_THRESHOLDS[sIdx].km) bestStage = sIdx;
+            }
+            const prevStage = announcedSignalStages[sigKey] !== undefined ? announcedSignalStages[sigKey] : -1;
+            if (bestStage > prevStage) {
+              announcedSignalStages[sigKey] = bestStage;
+              const sideSpeak = sd.side === "RHS" ? ", Right Hand" : "";
+              const remSpeak = sd.rem && !/right hand/i.test(sd.rem) && !new RegExp(sd.rem, "i").test(sd.name) ? `, ${sd.rem}` : "";
+              speakSignalCallout(`${sd.name}, ${sd.st}${sideSpeak}${remSpeak}`, sigKey);
+            }
+          }
+        } else {
+          document.getElementById("nextSignalText").textContent = "No signal ahead on route";
+          currentNextSignalTarget = null;
+        }
+
+        // Update NEXT Station UI
+        if (tel.nextStObj) {
+          const stKm = stationMeta[tel.nextStObj.code] && stationMeta[tel.nextStObj.code].km !== ""
+            ? `Km ${stationMeta[tel.nextStObj.code].km}`
+            : "Station";
+          document.getElementById("nextStationText").textContent = tel.nextStObj.arrived
+            ? `Arrived at ${tel.nextStObj.code} (${stKm})`
+            : `${tel.nextStObj.code} · ${stKm} (${tel.nextStObj.distKm.toFixed(2)} km)`;
+          currentNextStationTarget = stationMarkersByCode[tel.nextStObj.code];
+        } else {
+          document.getElementById("nextStationText").textContent = "No station ahead";
+          currentNextStationTarget = null;
+        }
+
+        // Update NEXT LC Gate UI
+        if (tel.nextLcObj) {
+          document.getElementById("nextLcText").textContent =
+            `${tel.nextLcObj.item.data.name} (${tel.nextLcObj.item.data.station}) · ${tel.nextLcObj.distKm.toFixed(2)} km`;
+          currentNextLcTarget = tel.nextLcObj.item.marker;
+        } else {
+          document.getElementById("nextLcText").textContent = "No LC gate ahead on route";
+          currentNextLcTarget = null;
+        }
+
+        // Update NEXT Bridge UI
+        if (tel.nextBrObj) {
+          document.getElementById("nextBridgeText").textContent =
+            `${tel.nextBrObj.item.data.name} · Km ${tel.nextBrObj.item.data.km} (${tel.nextBrObj.distKm.toFixed(2)} km)`;
+          currentNextBridgeTarget = tel.nextBrObj.item.marker;
+        } else {
+          document.getElementById("nextBridgeText").textContent = "No bridge ahead on route";
+          currentNextBridgeTarget = null;
+        }
+
+
+      }
+
+      function setTrackingUiState(mode, subtitle) {
+        const badge = document.getElementById("gpsModeBadge");
+        const sub = document.getElementById("liveStatusSubtext");
+        const headerBtn = document.getElementById("liveGpsHeaderBtn");
+        const headerLabel = document.getElementById("headerGpsLabel");
+        const startText = document.getElementById("startGpsBtnText");
+
+        badge.textContent = mode;
+        sub.textContent = subtitle;
+
+        if (mode === "Live GPS") {
+          headerBtn.className = "bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold px-3 py-1.5 rounded-lg transition cursor-pointer flex items-center gap-1.5 shadow-sm";
+          headerLabel.textContent = "Live GPS Active";
+          startText.textContent = "GPS Active";
+        } else {
+          headerBtn.className = "bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold px-3 py-1.5 rounded-lg transition cursor-pointer flex items-center gap-1.5 shadow-sm";
+          headerLabel.textContent = "Use My Location";
+          startText.textContent = "In Train GPS";
+        }
+      }
+
+      let screenWakeLock = null;
+      async function acquireWakeLock() {
+        try {
+          if ("wakeLock" in navigator && !screenWakeLock) {
+            screenWakeLock = await navigator.wakeLock.request("screen");
+            screenWakeLock.addEventListener("release", () => { screenWakeLock = null; });
+          }
+        } catch (e) {}
+      }
+      function releaseWakeLock() {
+        try {
+          if (screenWakeLock) {
+            screenWakeLock.release();
+            screenWakeLock = null;
+          }
+        } catch (e) {}
+      }
+      function warmUpTtsEngine() {
+        if ("speechSynthesis" in window) {
+          try {
+            window.speechSynthesis.resume();
+            selectPreferredVoice();
+          } catch (e) {}
+        }
+      }
+
+      function findNearestStationCode(lat, lon) {
+        let bestCode = null;
+        let bestDist = Infinity;
+        Object.keys(stationCoords).forEach(code => {
+          const p = stationCoords[code];
+          const d = haversineKm(lat, lon, p.lat, p.lon);
+          if (d < bestDist) {
+            bestDist = d;
+            bestCode = code;
+          }
+        });
+        return { code: bestCode, distKm: bestDist };
+      }
+
+      function stopAllTracking(clearMarkers) {
+        releaseWakeLock();
+        if (watchId !== null && navigator.geolocation) {
+          navigator.geolocation.clearWatch(watchId);
+          watchId = null;
+        }
+        if (simTimer) {
+          clearInterval(simTimer);
+          simTimer = null;
+          document.getElementById("simToggleBtn").textContent = "Run Route Sim";
+          document.getElementById("simStatusLabel").textContent = "Idle";
+        }
+        setCabBrake(false, false);
+        currentSimSpeedKmh = 0;
+        announcedSignalStages = {};
+        if ("speechSynthesis" in window) {
+          try { window.speechSynthesis.cancel(); } catch (e) {}
+        }
+        pinInspectMode = false;
+        document.body.classList.remove("pin-cursor");
+        document.getElementById("pinInspectBtnText").textContent = "Tap Route";
+
+        if (clearMarkers) {
+          liveGpsLayer.clearLayers();
+          trailPoints.length = 0;
+          trailPolyline.setLatLngs([]);
+          trailPolyline.addTo(liveGpsLayer);
+          liveMarker = null;
+          accuracyCircle = null;
+          snappedMarker = null;
+          snapConnectorLine = null;
+        }
+        setTrackingUiState("Ready", `Route: ${fromStationSelect.value} → ${toStationSelect.value}`);
+      }
+
+      function startRealGpsTracking() {
+        if (!realTrackLoaded) {
+          showToast("Waiting for Real Railway Track to finish loading...");
+          loadRealRailwayTracks(true);
+          return;
+        }
+        stopAllTracking(false);
+        warmUpTtsEngine();
+        acquireWakeLock();
+        if (!navigator.geolocation) {
+          showToast("Device GPS unavailable — starting Tap Route mode on real track");
+          enablePinInspectMode();
+          return;
+        }
+
+        let firstFixChecked = false;
+        function handleGpsFix(pos) {
+          const lat = pos.coords.latitude;
+          const lon = pos.coords.longitude;
+          const acc = pos.coords.accuracy || 8;
+          const spd = pos.coords.speed !== null && pos.coords.speed !== undefined
+            ? pos.coords.speed * 3.6
+            : null;
+
+          // On first fix inside the train, if current position is far from selected route, auto-snap Source to nearest station
+          if (!firstFixChecked) {
+            firstFixChecked = true;
+            const rPts = activeCustomRoute && activeCustomRoute.trackPts ? activeCustomRoute.trackPts : [];
+            let minRouteDistKm = Infinity;
+            for (let i = 0; i < rPts.length; i++) {
+              const d = haversineKm(lat, lon, rPts[i].lat, rPts[i].lon);
+              if (d < minRouteDistKm) minRouteDistKm = d;
+            }
+            if (minRouteDistKm > 3.0) {
+              const nearest = findNearestStationCode(lat, lon);
+              if (nearest.code && nearest.distKm <= 25.0) {
+                if (nearest.code !== fromStationSelect.value) {
+                  fromStationSelect.value = nearest.code;
+                  if (toStationSelect.value === nearest.code) {
+                    toStationSelect.value = nearest.code === "SUR" ? "KWV" : "SUR";
+                  }
+                  document.getElementById("simCorridorSelect").value = "custom";
+                  buildSelectedRouteFromStations(fromStationSelect.value, toStationSelect.value, false);
+                  showToast(`Located near ${nearest.code} — route updated for live train tracking`);
+                }
+              }
+            }
+          }
+
+          setTrackingUiState("Live GPS", `In Train GPS · ${fromStationSelect.value} → ${toStationSelect.value}`);
+          updateLivePosition(lat, lon, acc, spd, "In Train Live GPS", null);
+        }
+
+        setTrackingUiState("Live GPS", "Acquiring satellite GPS fix...");
+        navigator.geolocation.getCurrentPosition(
+          handleGpsFix,
+          () => {},
+          { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+        );
+
+        watchId = navigator.geolocation.watchPosition(
+          handleGpsFix,
+          err => {
+            // Only abort if user explicitly denied location permission; keep watching through brief coach/bridge dropouts
+            if (err && err.code === 1) {
+              watchId = null;
+              releaseWakeLock();
+              setTrackingUiState("Pin Mode", "GPS permission denied · Tap track or Run Sim");
+              showToast("Location permission denied — Tap map or Run Route Sim!");
+              enablePinInspectMode();
+            } else {
+              setTrackingUiState("Live GPS", "Reacquiring GPS fix (inside coach/bridge)...");
+            }
+          },
+          {
+            enableHighAccuracy: true,
+            maximumAge: 2000,
+            timeout: 20000
+          }
+        );
+      }
+
+      function enablePinInspectMode() {
+        if (!realTrackLoaded) {
+          showToast("Waiting for Real Railway Track to load first...");
+          loadRealRailwayTracks(true);
+          return;
+        }
+        if (simTimer) {
+          clearInterval(simTimer);
+          simTimer = null;
+          document.getElementById("simToggleBtn").textContent = "Run Route Sim";
+        }
+        pinInspectMode = !pinInspectMode;
+        if (pinInspectMode) {
+          document.body.classList.add("pin-cursor");
+          document.getElementById("pinInspectBtnText").textContent = "Pin Mode ON";
+          setTrackingUiState("Pin Check", "Tap anywhere on the map to check live chainage");
+          showToast("Tap anywhere near a corridor to snap onto the Real Railway Track!");
+        } else {
+          document.body.classList.remove("pin-cursor");
+          document.getElementById("pinInspectBtnText").textContent = "Tap Route";
+          setTrackingUiState("Ready", `Route: ${fromStationSelect.value} → ${toStationSelect.value}`);
+        }
+      }
+
+      map.on("click", e => {
+        if (pinInspectMode && realTrackLoaded) {
+          updateLivePosition(e.latlng.lat, e.latlng.lng, 4, 0, "Real Track Pin", null);
+        }
+      });
+
+      function onCustomStationRouteChange(fitMap) {
+        const fromSt = fromStationSelect.value;
+        const toSt = toStationSelect.value;
+        if (simTimer) {
+          clearInterval(simTimer);
+          simTimer = null;
+          document.getElementById("simToggleBtn").textContent = "Run Route Sim";
+        }
+        trailPoints.length = 0;
+        trailPolyline.setLatLngs([]);
+        buildSelectedRouteFromStations(fromSt, toSt, fitMap);
+
+        const startPt = stationCoords[fromSt];
+        if (startPt) {
+          updateLivePosition(startPt.lat, startPt.lon, 4, 0, `Source (${fromSt})`, null, activeCustomRoute.totalKm, 0);
+        }
+        document.getElementById("simStatusLabel").textContent = `${fromSt} → ${toSt}`;
+      }
+
+      fromStationSelect.addEventListener("change", () => {
+        document.getElementById("simCorridorSelect").value = "custom";
+        onCustomStationRouteChange(true);
+      });
+
+      toStationSelect.addEventListener("change", () => {
+        document.getElementById("simCorridorSelect").value = "custom";
+        onCustomStationRouteChange(true);
+      });
+
+      document.getElementById("swapRouteBtn").addEventListener("click", () => {
+        const tmp = fromStationSelect.value;
+        fromStationSelect.value = toStationSelect.value;
+        toStationSelect.value = tmp;
+        document.getElementById("simCorridorSelect").value = "custom";
+        onCustomStationRouteChange(true);
+        showToast(`Reversed route: ${fromStationSelect.value} → ${toStationSelect.value}`);
+      });
+
+      document.getElementById("fitSelectedRouteBtn").addEventListener("click", () => {
+        buildSelectedRouteFromStations(fromStationSelect.value, toStationSelect.value, true);
+      });
+
+      document.getElementById("clearCustomRouteBtn").addEventListener("click", () => {
+        document.getElementById("isolateRouteToggle").checked = false;
+        selectedRouteHighlightLayer.clearLayers();
+        corridors.forEach(c => {
+          const state = corridorLayers[c.id];
+          state.visible = true;
+          state.layer.addTo(map);
+        });
+        renderLineFilters();
+        map.fitBounds(allBounds, { padding: [30, 30] });
+        showToast("Showing full railway network");
+      });
+
+      document.getElementById("isolateRouteToggle").addEventListener("change", e => {
+        if (e.target.checked) {
+          buildSelectedRouteFromStations(fromStationSelect.value, toStationSelect.value, false);
+        } else {
+          corridors.forEach(c => {
+            const state = corridorLayers[c.id];
+            state.visible = true;
+            state.layer.addTo(map);
+          });
+          renderLineFilters();
+        }
+      });
+
+      document.getElementById("simCorridorSelect").addEventListener("change", e => {
+        const cid = e.target.value;
+        if (cid === "custom") return;
+        const corridorObj = corridorMap[cid];
+        if (!corridorObj) return;
+        const firstSt = corridorObj.orderedNames[0];
+        const lastSt = corridorObj.orderedNames[corridorObj.orderedNames.length - 1];
+        fromStationSelect.value = firstSt;
+        toStationSelect.value = lastSt;
+        onCustomStationRouteChange(true);
+      });
+
+      function toggleFootplateSimulation() {
+        if (!realTrackLoaded) {
+          showToast("Waiting for Real Railway Track to load first...");
+          loadRealRailwayTracks(true);
+          return;
+        }
+        if (simTimer) {
+          clearInterval(simTimer);
+          simTimer = null;
+          document.getElementById("simToggleBtn").textContent = "Run Route Sim";
+          document.getElementById("simStatusLabel").textContent = "Paused";
+          setTrackingUiState("Sim Paused", "Real-track simulation paused");
+          return;
+        }
+
+        const fromSt = fromStationSelect.value;
+        const toSt = toStationSelect.value;
+        if (fromSt === toSt) {
+          showToast("Please select different Source and Destination stations");
+          return;
+        }
+
+        stopAllTracking(true);
+        warmUpTtsEngine();
+        acquireWakeLock();
+        document.getElementById("followGpsToggle").checked = true;
+        buildSelectedRouteFromStations(fromSt, toSt, false);
+
+        activeCustomRoute.cids.forEach(cid => {
+          corridorLayers[cid].visible = true;
+          corridorLayers[cid].layer.addTo(map);
+        });
+        renderLineFilters();
+
+        setCabBrake(false, false);
+        if (cabReverser === "N") setCabReverser("F");
+        if (cabNotch === 0) setCabNotch(4);
+        const speedKmh = getActiveSimSpeedKmh();
+        const trackPts = activeCustomRoute.trackPts;
+        const cumDist = activeCustomRoute.cumDist;
+        const totalKm = activeCustomRoute.totalKm;
+        if (!trackPts || trackPts.length < 2 || !cumDist) {
+          showToast("Route path unavailable");
+          return;
+        }
+
+        const routeLabel = `${fromSt} → ${toSt}`;
+        let simDistKm = cabReverser === "R" ? totalKm : 0;
+        simIndex = cabReverser === "R" ? trackPts.length - 2 : 0;
+        currentSimSpeedKmh = Math.min(15, speedKmh); // Start rolling smoothly
+        document.getElementById("simToggleBtn").textContent = "Pause Sim";
+        document.getElementById("simStatusLabel").textContent = `${routeLabel} (${simDistKm.toFixed(1)}/${totalKm.toFixed(1)} km)`;
+        setTrackingUiState("Route Sim", `Cab ${cabReverser}·N${cabNotch} (Target ${speedKmh} km/h): ${routeLabel}`);
+
+        const startPt = trackPts[simIndex];
+        simTimer = setInterval(() => {
+          const mult = getSimMultiplier();
+          const dtSimSec = 0.2 * mult;
+          const autoBrkOn = document.getElementById("autoBrakeToggle") && document.getElementById("autoBrakeToggle").checked;
+
+          // Physics stopping distance check: d = v^2 / (2 * a), service braking a = 0.80 m/s^2
+          const distToStopEndpointKm = cabReverser === "R" ? simDistKm : Math.max(0, totalKm - simDistKm);
+          const vMs = currentSimSpeedKmh / 3.6;
+          const physicsStopDistKm = (vMs * vMs) / (2 * 0.80 * 1000) + 0.08;
+
+          if (autoBrkOn && !autoBrakeEngaged && currentSimSpeedKmh > 2 && distToStopEndpointKm <= physicsStopDistKm) {
+            setCabNotch(0);
+            setCabBrake(true, true);
+            showToast(`Auto-Brake engaged (${distToStopEndpointKm.toFixed(2)} km to stop)`);
+          }
+
+          const targetSpeed = getActiveSimSpeedKmh();
+          if (autoBrakeEngaged && distToStopEndpointKm > 0.005) {
+            // Smooth physics deceleration a = v^2 / (2 * s) so train stops right at destination
+            const reqDecelMs2 = Math.max(0.45, Math.min(1.5, (vMs * vMs) / (2 * distToStopEndpointKm * 1000)));
+            currentSimSpeedKmh = Math.max(0, currentSimSpeedKmh - (reqDecelMs2 * 3.6) * dtSimSec);
+          } else if (cabBrakeApplied) {
+            // Manual service brake (~0.85 m/s^2 = 3.06 km/h/s)
+            currentSimSpeedKmh = Math.max(0, currentSimSpeedKmh - 3.06 * dtSimSec);
+          } else if (currentSimSpeedKmh < targetSpeed) {
+            // Traction acceleration
+            currentSimSpeedKmh = Math.min(targetSpeed, currentSimSpeedKmh + 2.4 * dtSimSec);
+          } else if (currentSimSpeedKmh > targetSpeed) {
+            // Coasting drag (~0.65 km/h/s) when Neutral/Idle, or dynamic/notch-down deceleration (~2.0 km/h/s)
+            const decelRate = (cabReverser === "N" || cabNotch === 0) ? 0.65 : 2.0;
+            currentSimSpeedKmh = Math.max(targetSpeed, currentSimSpeedKmh - decelRate * dtSimSec);
+          }
+
+          const curSpeed = currentSimSpeedKmh;
+          const dirSign = cabReverser === "F" ? 1 : (cabReverser === "R" ? -1 : 0);
+          simDistKm += dirSign * (curSpeed / 3600) * dtSimSec;
+
+          if (cabReverser === "F" && simDistKm >= totalKm) {
+            const endPt = trackPts[trackPts.length - 1];
+            updateLivePosition(endPt.lat, endPt.lon, 3, curSpeed, `Sim (${routeLabel})`, endPt.cid, 0, trackPts.length - 1);
+            clearInterval(simTimer);
+            simTimer = null;
+            document.getElementById("simToggleBtn").textContent = "Run Route Sim";
+            document.getElementById("simStatusLabel").textContent = `Arrived at ${toSt}`;
+            setTrackingUiState("Completed", `Completed ${routeLabel}`);
+            showToast(`Completed real-track simulation from ${fromSt} to ${toSt}`);
+            return;
+          }
+          if (cabReverser === "R" && simDistKm <= 0) {
+            simDistKm = 0;
+            const originPt = trackPts[0];
+            updateLivePosition(originPt.lat, originPt.lon, 3, curSpeed, `Sim Rev (${routeLabel})`, originPt.cid, totalKm, 0);
+            clearInterval(simTimer);
+            simTimer = null;
+            document.getElementById("simToggleBtn").textContent = "Run Route Sim";
+            document.getElementById("simStatusLabel").textContent = `Reversed to ${fromSt}`;
+            setTrackingUiState("Completed", `Reversed to ${fromSt}`);
+            showToast(`Reversed back to ${fromSt}`);
+            return;
+          }
+
+          simDistKm = Math.max(0, Math.min(totalKm, simDistKm));
+          while (simIndex < trackPts.length - 2 && cumDist[simIndex + 1] < simDistKm) {
+            simIndex++;
+          }
+          while (simIndex > 0 && cumDist[simIndex] > simDistKm) {
+            simIndex--;
+          }
+          const segLen = cumDist[simIndex + 1] - cumDist[simIndex];
+          const localT = segLen > 0 ? Math.max(0, Math.min(1, (simDistKm - cumDist[simIndex]) / segLen)) : 0;
+          const a = trackPts[simIndex];
+          const b = trackPts[simIndex + 1];
+          const curLat = a.lat + (b.lat - a.lat) * localT;
+          const curLon = a.lon + (b.lon - a.lon) * localT;
+          const remainKm = Math.max(0, totalKm - simDistKm);
+
+          document.getElementById("simStatusLabel").textContent = `${routeLabel} (${simDistKm.toFixed(1)}/${totalKm.toFixed(1)} km)`;
+          setTrackingUiState("Route Sim", `Cab ${cabReverser}·N${cabNotch} (${curSpeed.toFixed(0)}/${targetSpeed} km/h · ${mult}x): ${routeLabel}`);
+          updateLivePosition(curLat, curLon, 3, curSpeed, `Sim (${cabReverser}·N${cabNotch})`, a.cid, remainKm, simIndex);
+        }, 200);
+
+        updateLivePosition(startPt.lat, startPt.lon, 3, speedKmh, `Sim (${cabReverser}·N${cabNotch})`, startPt.cid, Math.max(0, totalKm - simDistKm), simIndex);
+      }
+
+      map.fitBounds(allBounds, { padding: [30, 30] });
+      loadRealRailwayTracks(false);
+
+      // Bind Live Location Controls
+      document.getElementById("startGpsBtn").addEventListener("click", startRealGpsTracking);
+      document.getElementById("liveGpsHeaderBtn").addEventListener("click", () => {
+        if (watchId !== null) {
+          stopAllTracking(false);
+          showToast("Live GPS tracking paused");
+        } else {
+          startRealGpsTracking();
+        }
+      });
+      document.getElementById("pinInspectBtn").addEventListener("click", enablePinInspectMode);
+      document.getElementById("stopTrackingBtn").addEventListener("click", () => {
+        stopAllTracking(true);
+        showToast("Cleared live trail and reset tracker");
+      });
+      document.getElementById("simToggleBtn").addEventListener("click", toggleFootplateSimulation);
+      document.getElementById("revFBtn").addEventListener("click", () => setCabReverser("F"));
+      document.getElementById("revNBtn").addEventListener("click", () => setCabReverser("N"));
+      document.getElementById("revRBtn").addEventListener("click", () => setCabReverser("R"));
+      document.getElementById("cabBrakeBtn").addEventListener("click", () => setCabBrake(!cabBrakeApplied, false));
+      document.querySelectorAll(".notch-btn").forEach(btn => {
+        btn.addEventListener("click", () => setCabNotch(Number(btn.getAttribute("data-notch"))));
+      });
+
+      document.getElementById("locateMeBtn").addEventListener("click", () => {
+        document.getElementById("followGpsToggle").checked = true;
+        if (lastLiveFix) {
+          map.flyTo([lastLiveFix.lat, lastLiveFix.lon], Math.max(map.getZoom(), 13), { duration: 0.8 });
+          if (liveMarker) liveMarker.openPopup();
+        } else {
+          startRealGpsTracking();
+        }
+      });
+
+      document.getElementById("jumpNextSignalBtn").addEventListener("click", () => {
+        if (currentNextSignalTarget) {
+          document.getElementById("followGpsToggle").checked = false;
+          const ll = currentNextSignalTarget.getLatLng();
+          map.flyTo(ll, 15, { duration: 0.8 });
+          currentNextSignalTarget.openPopup();
+        }
+      });
+
+      document.getElementById("jumpNextStationBtn").addEventListener("click", () => {
+        if (currentNextStationTarget) {
+          document.getElementById("followGpsToggle").checked = false;
+          const ll = currentNextStationTarget.getLatLng();
+          map.flyTo(ll, 13, { duration: 0.8 });
+          currentNextStationTarget.openPopup();
+        }
+      });
+
+      document.getElementById("jumpNextLcBtn").addEventListener("click", () => {
+        if (currentNextLcTarget) {
+          document.getElementById("followGpsToggle").checked = false;
+          const ll = currentNextLcTarget.getLatLng();
+          map.flyTo(ll, 14, { duration: 0.8 });
+          currentNextLcTarget.openPopup();
+        }
+      });
+
+      document.getElementById("jumpNextBridgeBtn").addEventListener("click", () => {
+        if (currentNextBridgeTarget) {
+          document.getElementById("followGpsToggle").checked = false;
+          const ll = currentNextBridgeTarget.getLatLng();
+          map.flyTo(ll, 14, { duration: 0.8 });
+          currentNextBridgeTarget.openPopup();
+        }
+      });
+
+      document.getElementById("copyInspectionReportBtn").addEventListener("click", () => {
+        if (!lastLiveFix) return;
+        const t = lastLiveFix.tel;
+        const report = [
+          `SOLAPUR DIVISION — REAL TRACK LIVE INSPECTION LOG`,
+          `Timestamp: ${new Date().toISOString()}`,
+          `Selected Route: ${fromStationSelect.value} to ${toStationSelect.value} (${activeCustomRoute.totalKm.toFixed(1)} km)`,
+          `Section: ${t.corridor.label} (${t.corridor.doubleLine ? "Double Line" : "Single Line"})`,
+          `Live Chainage: Km ${t.interpolatedKm.toFixed(2)}`,
+          `Block Section: ${t.stA} to ${t.stB}`,
+          `Remaining to ${t.destSt}: ${t.remainToDestKm.toFixed(2)} km`,
+          `Real Track Offset: ${t.offsetMeters} m`,
+          `Next Signal: ${t.nextSigObj ? t.nextSigObj.item.data.name + " [" + t.nextSigObj.item.data.mast + "] (" + t.nextSigObj.distKm.toFixed(2) + " km)" : "None"}`,
+          `Next Station: ${t.nextStObj ? t.nextStObj.code + " (" + t.nextStObj.distKm.toFixed(2) + " km)" : "None"}`,
+          `Next LC Gate: ${t.nextLcObj ? t.nextLcObj.item.data.name + " (" + t.nextLcObj.item.data.distKm + ")" : "None"}`,
+          `Next Bridge: ${t.nextBrObj ? t.nextBrObj.item.data.name + " (" + t.nextBrObj.distKm.toFixed(2) + " km)" : "None"}`,
+          `Coordinates: ${lastLiveFix.lat.toFixed(6)}, ${lastLiveFix.lon.toFixed(6)} (Speed: ${lastLiveFix.speedKmh.toFixed(1)} km/h)`
+        ].join("\\n");
+
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(report).then(() => {
+            showToast("Copied official route inspection report to clipboard");
+          }).catch(() => {
+            showToast("Inspection report ready: Km " + t.interpolatedKm.toFixed(2));
+          });
+        } else {
+          showToast("Inspection report ready: Km " + t.interpolatedKm.toFixed(2));
+        }
+      });
+
+      const livePanelBody = document.getElementById("livePanelBody");
+      const toggleLivePanelBtn = document.getElementById("toggleLivePanelBtn");
+      toggleLivePanelBtn.addEventListener("click", () => {
+        const hidden = livePanelBody.classList.toggle("hidden");
+        toggleLivePanelBtn.textContent = hidden ? "Expand" : "Min";
+      });
+
+      const lineFiltersEl = document.getElementById("lineFilters");
+      function renderLineFilters() {
+        lineFiltersEl.innerHTML = "";
+        corridors.forEach(c => {
+          const state = corridorLayers[c.id];
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = `flex items-center gap-1.5 px-2 py-1.5 rounded-lg border text-left transition cursor-pointer ${
+            state.visible
+              ? "bg-slate-800 border-slate-600 text-slate-100"
+              : "bg-slate-900/50 border-slate-800 text-slate-500 opacity-60"
+          }`;
+          btn.innerHTML = `<span class="w-3 h-3 rounded-full shrink-0" style="background:${c.color};"></span><span class="truncate text-[10px]">${c.label}</span>`;
+          btn.addEventListener("click", () => {
+            state.visible = !state.visible;
+            if (state.visible) state.layer.addTo(map);
+            else map.removeLayer(state.layer);
+            renderLineFilters();
+          });
+          lineFiltersEl.appendChild(btn);
+        });
+      }
+      renderLineFilters();
+
+      document.getElementById("showAllLinesBtn").addEventListener("click", () => {
+        document.getElementById("isolateRouteToggle").checked = false;
+        corridors.forEach(c => {
+          const state = corridorLayers[c.id];
+          state.visible = true;
+          state.layer.addTo(map);
+        });
+        renderLineFilters();
+      });
+
+      document.getElementById("toggleStations").addEventListener("change", e => {
+        if (e.target.checked) stationsLayer.addTo(map);
+        else map.removeLayer(stationsLayer);
+      });
+
+      document.getElementById("toggleLabels").addEventListener("change", e => {
+        if (e.target.checked) labelsLayer.addTo(map);
+        else map.removeLayer(labelsLayer);
+      });
+
+      document.getElementById("toggleSignals").addEventListener("change", e => {
+        if (e.target.checked) signalsLayer.addTo(map);
+        else map.removeLayer(signalsLayer);
+      });
+
+      document.getElementById("toggleLCs").addEventListener("change", e => {
+        if (e.target.checked) lcsLayer.addTo(map);
+        else map.removeLayer(lcsLayer);
+      });
+
+      document.getElementById("toggleBridges").addEventListener("change", e => {
+        if (e.target.checked) bridgesLayer.addTo(map);
+        else map.removeLayer(bridgesLayer);
+      });
+
+      document.getElementById("toggleBoundaries").addEventListener("change", e => {
+        if (e.target.checked) boundariesLayer.addTo(map);
+        else map.removeLayer(boundariesLayer);
+      });
+
+      const railAtlasLayer = L.tileLayer("https://{s}.tiles.openrailwaymap.org/standard/{z}/{x}/{y}.png", {
+        subdomains: ["a", "b", "c"],
+        attribution: "Map data &copy; OpenRailwayMap",
+        maxZoom: 19,
+        opacity: 0.85
+      });
+      document.getElementById("toggleRailAtlas").addEventListener("change", e => {
+        if (e.target.checked) railAtlasLayer.addTo(map);
+        else map.removeLayer(railAtlasLayer);
+      });
+
+      document.getElementById("basemapSelect").addEventListener("change", e => {
+        map.removeLayer(activeBasemap);
+        activeBasemap = basemaps[e.target.value] || basemaps.satellite;
+        activeBasemap.addTo(map);
+      });
+
+      document.getElementById("resetViewBtn").addEventListener("click", () => {
+        map.fitBounds(allBounds, { padding: [30, 30] });
+      });
+
+      const panelBody = document.getElementById("panelBody");
+      const togglePanelBtn = document.getElementById("togglePanelBtn");
+      togglePanelBtn.addEventListener("click", () => {
+        const hidden = panelBody.classList.toggle("hidden");
+        togglePanelBtn.textContent = hidden ? "Show" : "Hide";
+      });
+
+
+
+      const searchInput = document.getElementById("searchInput");
+      const searchResults = document.getElementById("searchResults");
+
+      searchInput.addEventListener("input", () => {
+        const q = searchInput.value.trim().toLowerCase();
+        if (!q) {
+          searchResults.classList.add("hidden");
+          searchResults.innerHTML = "";
+          return;
+        }
+        const matches = searchableItems
+          .filter(item => item.label.toLowerCase().includes(q) || item.sub.toLowerCase().includes(q))
+          .slice(0, 12);
+
+        if (matches.length === 0) {
+          searchResults.innerHTML = '<div class="px-3 py-2 text-xs text-slate-400">No matching feature found</div>';
+        } else {
+          searchResults.innerHTML = "";
+          matches.forEach(m => {
+            const row = document.createElement("button");
+            row.type = "button";
+            row.className = "w-full text-left px-3 py-2 hover:bg-slate-700/80 flex items-center justify-between text-xs border-b border-slate-700/50 last:border-0 cursor-pointer";
+            row.innerHTML = `<span class="font-medium text-slate-100">${m.label}</span><span class="text-[10px] text-slate-400">${m.sub}</span>`;
+            row.addEventListener("click", () => {
+              document.getElementById("followGpsToggle").checked = false;
+              map.flyTo([m.lat, m.lon], 13, { duration: 0.9 });
+              m.marker.openPopup();
+              searchResults.classList.add("hidden");
+              searchInput.value = m.label;
+            });
+            searchResults.appendChild(row);
+          });
+        }
+        searchResults.classList.remove("hidden");
+      });
+
+      document.addEventListener("click", e => {
+        if (!searchInput.contains(e.target) && !searchResults.contains(e.target)) {
+          searchResults.classList.add("hidden");
+        }
+      });
+
+      // =========================================================================
+      // LIVE TRAINS MODULE
+      // -------------------------------------------------------------------------
+      // Pipeline:  provider (network / live / demo)  ->  normalized train  ->
+      //            locate on the real track geometry  ->  Leaflet marker (1s tick).
+      //
+      // Normalized train shape (what any provider must return):
+      //   { id, number, name, status, delayMin, updatedAt (ms), simulated?,
+      //     stops: [{ code, name, arr (ms), dep (ms), halt }],     // in route order
+      //     loc:   { stationCode, status, distanceFromLastStationKm, speedKmh } | null }
+      // =========================================================================
+      const LT_STORE = "railLiveTrainsCfg_v2";
+      const ltCfg = {
+        provider: "network",
+        networkUrl: "/api/live-network",
+        baseUrl: "https://api.railradar.in",
+        apiKey: "",
+        authStyle: "header",
+        intervalMin: 3,
+        trains: [],
+        usage: { m: "", n: 0 }
+      };
+      try { const raw = localStorage.getItem(LT_STORE); if (raw) Object.assign(ltCfg, JSON.parse(raw)); } catch (e) {}
+      if (location.protocol.startsWith("http")) { ltCfg.provider = "network"; ltCfg.networkUrl = "/api/live-network"; }
+      function ltSave() { try { localStorage.setItem(LT_STORE, JSON.stringify(ltCfg)); } catch (e) {} }
+
+      // <LT-PURE>
+      const ltEsc = s => String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+      // API station code -> map station code (case-insensitive). Add aliases here if a feed uses different codes.
+      const ltAlias = {};
+      const ltCodeIndex = {};
+      Object.keys(stationCoords).forEach(k => { ltCodeIndex[k.toUpperCase()] = k; });
+      function ltResolve(code) {
+        if (!code) return null;
+        const u = String(code).trim().toUpperCase();
+        const a = ltAlias[u] ? String(ltAlias[u]).toUpperCase() : u;
+        return ltCodeIndex[a] || null;
+      }
+
+      // ---- geometry: polyline between two stations along the real track ----
+      let ltGeoVer = -1;
+      const ltGeoCache = new Map();
+      function ltTrackBetween(a, b) {
+        const ver = Object.keys(blockRealTrackPoints).length;
+        if (ver !== ltGeoVer) { ltGeoCache.clear(); ltGeoVer = ver; }
+        const key = a + "|" + b;
+        if (ltGeoCache.has(key)) return ltGeoCache.get(key);
+        let pts = [];
+        let solvedOk = false;
+        const solved = findStationRouteChain(a, b);
+        if (solved && solved.steps.length) {
+          solvedOk = true;
+          solved.steps.forEach((step, idx) => {
+            const raw = blockRealTrackPoints[`${step.cid}:${step.blockIdx}`];
+            let bp;
+            if (raw && raw.length >= 2) bp = step.forward ? raw.slice() : raw.slice().reverse();
+            else {
+              const s = corridorMap[step.cid].segs[step.blockIdx];
+              bp = step.forward ? [{ lat: s[0], lon: s[1] }, { lat: s[2], lon: s[3] }] : [{ lat: s[2], lon: s[3] }, { lat: s[0], lon: s[1] }];
+            }
+            for (let k = 0; k < bp.length; k++) { if (idx > 0 && k === 0) continue; pts.push({ lat: bp[k].lat, lon: bp[k].lon }); }
+          });
+        } else {
+          const A = stationCoords[a], B = stationCoords[b];
+          pts = [{ lat: A.lat, lon: A.lon }, { lat: B.lat, lon: B.lon }];
+        }
+        const cum = new Float64Array(pts.length);
+        for (let i = 1; i < pts.length; i++) cum[i] = cum[i - 1] + haversineKm(pts[i - 1].lat, pts[i - 1].lon, pts[i].lat, pts[i].lon);
+        const straight = haversineKm(stationCoords[a].lat, stationCoords[a].lon, stationCoords[b].lat, stationCoords[b].lon);
+        const total = cum[cum.length - 1];
+        // reject absurd detours (train probably left the mapped network between these stations)
+        const g = { pts, cum, total, ok: solvedOk && total <= straight * 2.5 + 2 };
+        ltGeoCache.set(key, g);
+        return g;
+      }
+      function ltBearing(a, b) {
+        const p1 = a.lat * Math.PI / 180, p2 = b.lat * Math.PI / 180, dl = (b.lon - a.lon) * Math.PI / 180;
+        const y = Math.sin(dl) * Math.cos(p2), x = Math.cos(p1) * Math.sin(p2) - Math.sin(p1) * Math.cos(p2) * Math.cos(dl);
+        return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+      }
+      function ltLerpAt(g, d) {
+        const c = g.cum, n = g.pts.length;
+        d = Math.max(0, Math.min(g.total, d));
+        let lo = 0, hi = n - 1;
+        while (hi - lo > 1) { const m = (lo + hi) >> 1; if (c[m] <= d) lo = m; else hi = m; }
+        const a = g.pts[lo], b = g.pts[hi], seg = c[hi] - c[lo], t = seg > 0 ? (d - c[lo]) / seg : 0;
+        return { lat: a.lat + (b.lat - a.lat) * t, lon: a.lon + (b.lon - a.lon) * t };
+      }
+      function ltPointAt(g, d) {
+        const p = ltLerpAt(g, d);
+        const p1 = ltLerpAt(g, d - 0.08), p2 = ltLerpAt(g, d + 0.08);
+        p.bearing = ltBearing(p1, p2);
+        return p;
+      }
+
+      // ---- positioning ----
+      function ltKnownStops(t) {
+        if (t._known && t._knownFor === t.stops) return t._known;
+        const out = [];
+        (t.stops || []).forEach(s => {
+          const c = ltResolve(s.code);
+          if (c && Number.isFinite(s.arr) && Number.isFinite(s.dep)) out.push({ code: c, name: s.name || c, arr: s.arr, dep: s.dep, halt: s.halt !== false });
+        });
+        t._known = out; t._knownFor = t.stops;
+        return out;
+      }
+      function ltLocate(t, now) {
+        const K = ltKnownStops(t);
+        if (/cancel/i.test(t.status || "")) return { state: "cancelled" };
+        if (!K.length) return { state: "outside", reason: "None of this train's stations are on the mapped network" };
+
+        // 1) Feed-supplied position anchor (works for both halting stops and non-halting pass-through stations)
+        const cl = t.loc;
+        if (cl && cl.stationCode && t.updatedAt && now - t.updatedAt < 20 * 60000) {
+          const a = ltResolve(cl.stationCode);
+          if (a && stationCoords[a]) {
+            const i = K.findIndex(k => k.code === a);
+            const nextCode = ltResolve(cl.nextStationCode) || (i >= 0 && i + 1 < K.length ? K[i + 1].code : null);
+            const nextStop = nextCode ? (K.find(k => k.code === nextCode) || { code: nextCode, arr: now + 600000 }) : null;
+            if (/at-?station/i.test(cl.status || "")) {
+              const st = stationCoords[a];
+              let bearing = null;
+              if (nextCode && stationCoords[nextCode]) {
+                const g = ltTrackBetween(a, nextCode);
+                if (g.ok) bearing = ltPointAt(g, 0.1).bearing;
+              }
+              return { state: "station", lat: st.lat, lon: st.lon, code: a, next: nextStop, bearing, mode: "live station anchor" };
+            }
+            if (nextCode && stationCoords[nextCode] && Number.isFinite(+cl.distanceFromLastStationKm) && +cl.distanceFromLastStationKm > 0) {
+              const g = ltTrackBetween(a, nextCode);
+              if (g.ok) {
+                const spd = Number.isFinite(+cl.speedKmh) ? +cl.speedKmh : 0;
+                const d = Math.min(g.total * 0.995, +cl.distanceFromLastStationKm + spd * Math.max(0, now - t.updatedAt) / 3600000);
+                const p = ltPointAt(g, d);
+                return { state: "moving", lat: p.lat, lon: p.lon, bearing: p.bearing, from: a, to: nextCode, next: nextStop, speed: spd, mode: "feed position", geo: g, dist: d };
+              }
+            }
+          }
+        }
+
+        // 2) Timetable + current delay (arr/dep are already delay-adjusted)
+        const last = K[K.length - 1];
+        const terminates = (t.stops.length && ltResolve(t.stops[t.stops.length - 1].code) === last.code);
+        const lastDep = terminates ? Math.max(last.dep, last.arr + 5 * 60000) : last.dep;
+        if (now < K[0].arr) return { state: "upcoming", at: K[0].code, next: K[0] };
+        for (let i = 0; i < K.length; i++) {
+          const k = K[i], n = K[i + 1];
+          const dep = (i === K.length - 1) ? lastDep : k.dep;
+          if (now >= k.arr && now <= dep) {
+            const st = stationCoords[k.code];
+            let bearing = null;
+            if (n) { const g = ltTrackBetween(k.code, n.code); if (g.ok) bearing = ltPointAt(g, 0.1).bearing; }
+            return { state: "station", lat: st.lat, lon: st.lon, code: k.code, next: n || null, bearing, mode: "timetable estimate" };
+          }
+          if (n && now > dep && now < n.arr) {
+            const g = ltTrackBetween(k.code, n.code);
+            if (!g.ok) return { state: "outside", reason: `Between ${k.code} and ${n.code} (off the mapped network)` };
+            const f = (now - dep) / Math.max(1, n.arr - dep);
+            const p = ltPointAt(g, f * g.total);
+            const spd = (g.total / Math.max(1, n.arr - dep)) * 3600000;
+            return { state: "moving", lat: p.lat, lon: p.lon, bearing: p.bearing, from: k.code, to: n.code, next: n, speed: spd, mode: "timetable estimate", geo: g, dist: f * g.total };
+          }
+        }
+        return { state: "exited" };
+      }
+
+      // ---- provider: RailRadar-compatible REST (GET {base}/v1/trains/{no}/live) ----
+      function ltNormalizeRailRadar(json) {
+        const d = json && json.data;
+        if (!d || !Array.isArray(d.route)) throw new Error("Unexpected response shape");
+        const baseDelay = Number.isFinite(+d.delayMinutes) ? +d.delayMinutes : 0;
+        let prev = -Infinity;
+        const stops = [];
+        d.route.forEach(r => {
+          const dl = x => (Number.isFinite(+x) && x !== null && x !== "") ? +x : baseDelay;
+          let arr = Date.parse(r.actualArrival), dep = Date.parse(r.actualDeparture);
+          const sArr = Date.parse(r.scheduledArrival), sDep = Date.parse(r.scheduledDeparture);
+          if (!Number.isFinite(arr)) arr = sArr + dl(r.delayArrival !== undefined ? r.delayArrival : r.delayDeparture) * 60000;
+          if (!Number.isFinite(dep)) dep = sDep + dl(r.delayDeparture !== undefined ? r.delayDeparture : r.delayArrival) * 60000;
+          if (!Number.isFinite(arr)) arr = dep;
+          if (!Number.isFinite(dep)) dep = arr;
+          if (!Number.isFinite(arr)) return;
+          if (arr < prev) arr = prev;
+          if (dep < arr) dep = arr;
+          prev = dep;
+          stops.push({ code: r.stationCode, name: r.stationName, arr, dep, halt: r.isHalt !== false });
+        });
+        const num = d.trainNumber || (d.train && d.train.number);
+        return {
+          id: String(num), number: String(num), name: d.trainName || (d.train && d.train.name) || String(num),
+          type: d.train && d.train.type, status: d.status || "running", delayMin: baseDelay,
+          updatedAt: Date.parse(d.lastUpdatedAt) || Date.now(), stops, loc: d.currentLocation || null,
+          dest: d.train && d.train.destination && d.train.destination.name, source: "live"
+        };
+      }
+
+      // ---- provider: DEMO (clearly simulated, runs on your own corridors) ----
+      const LT_DEMO_DEFS = [
+        { no: "SIM-01", name: "Simulated Express", cid: "c1", rev: false, speed: 82, every: 4, phase: 0.00, delay: 0 },
+        { no: "SIM-02", name: "Simulated Express", cid: "c1", rev: true,  speed: 78, every: 4, phase: 0.35, delay: 7 },
+        { no: "SIM-03", name: "Simulated Passenger", cid: "c3", rev: false, speed: 62, every: 1, phase: 0.10, delay: 3 },
+        { no: "SIM-04", name: "Simulated Express", cid: "c3", rev: true,  speed: 85, every: 3, phase: 0.55, delay: 0 },
+        { no: "SIM-05", name: "Simulated Express", cid: "c4", rev: false, speed: 80, every: 3, phase: 0.20, delay: 18 },
+        { no: "SIM-06", name: "Simulated Passenger", cid: "c5", rev: false, speed: 52, every: 1, phase: 0.40, delay: 2 },
+        { no: "SIM-07", name: "Simulated Passenger", cid: "c6", rev: true,  speed: 55, every: 1, phase: 0.70, delay: 0 }
+      ];
+      function ltDemoTrains(now) {
+        const out = [];
+        LT_DEMO_DEFS.forEach(def => {
+          const c = corridorMap[def.cid];
+          if (!c) return;
+          const fwd = c.orderedNames.slice();
+          const mk = path => {
+            let d = 0, t = 0; const rows = [];
+            path.forEach((code, i) => {
+              if (i > 0) { const a = stationCoords[path[i - 1]], b = stationCoords[code]; d = haversineKm(a.lat, a.lon, b.lat, b.lon) * 1.12; t += d / def.speed * 3600000; }
+              const halts = i === 0 || i === path.length - 1 || i % def.every === 0 || junctionStations.has(code);
+              const dwell = halts ? 120000 : 0;
+              rows.push({ code, name: code, arr: t, dep: t + dwell, halt: halts });
+              t += dwell;
+            });
+            return rows;
+          };
+          const rowsF = mk(fwd);
+          const T = rowsF[rowsF.length - 1].arr, L = 8 * 60000, leg = T + L, cyc = 2 * leg;
+          const loc = (now + def.phase * cyc) % cyc;
+          const rawLeg = loc < leg ? 0 : 1;
+          const legStart = now - (loc - rawLeg * leg);
+          const dirRev = ((rawLeg + (def.rev ? 1 : 0)) % 2) === 1;
+          const path = dirRev ? fwd.slice().reverse() : fwd;
+          const rows = mk(path);
+          const stops = rows.map((r, i) => ({ code: r.code, name: r.name, arr: legStart + r.arr, dep: legStart + r.dep + (i === rows.length - 1 ? L : 0), halt: r.halt }));
+          out.push({
+            id: def.no, number: def.no, name: `${def.name} ${path[0]} → ${path[path.length - 1]}`, type: "Simulated",
+            status: "running", delayMin: def.delay, updatedAt: now, stops, loc: null, simulated: true, source: "demo", dest: path[path.length - 1]
+          });
+        });
+        return out;
+      }
+      // </LT-PURE>
+
+      // ---------------- state ----------------
+      map.createPane("trainPane").style.zIndex = 495;
+      const ltLayer = L.layerGroup().addTo(map);
+      const ltPathLayer = L.layerGroup().addTo(map);
+      const ltTrains = new Map();   // id -> normalized train
+      const ltLocs = new Map();     // id -> last computed location
+      const ltMarkers = new Map();  // id -> { marker, sig }
+      const ltErrors = new Map();   // id -> message
+      let ltNetworkError = "";
+      let ltSelected = null, ltFollow = null, ltPollBusy = false, ltPollTimer = null, ltLastPoll = 0, ltDemoBuiltAt = 0;
+
+      const $lt = id => document.getElementById(id);
+      const ltTime = ms => new Date(ms).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "Asia/Kolkata" });
+      const ltSleep = ms => new Promise(r => setTimeout(r, ms));
+      function ltDelayColor(t, loc) {
+        if (!loc || loc.state === "upcoming" || loc.state === "cancelled") return "#64748b";
+        const d = t.delayMin || 0;
+        return d <= 5 ? "#10b981" : d <= 15 ? "#f59e0b" : d <= 45 ? "#f97316" : "#ef4444";
+      }
+      const ltDelayTxt = t => { const d = Math.round(t.delayMin || 0); return d === 0 ? "On time" : (d > 0 ? "+" + d + "m" : d + "m"); };
+
+      function ltMakeIcon(t, loc, sel) {
+        const c = ltDelayColor(t, loc);
+        const inner = loc.bearing != null
+          ? `<svg viewBox="0 0 24 24" width="13" height="13" style="transform:rotate(${Math.round(loc.bearing)}deg)"><path d="M12 2l7.5 19L12 16.5 4.5 21z" fill="#fff"/></svg>`
+          : `<span class="lt-stop"></span>`;
+        const shortDelay = (t.delayMin || 0) === 0 ? "" : `<b>${ltEsc(ltDelayTxt(t))}</b>`;
+        return L.divIcon({
+          className: "lt-icon", iconSize: [24, 24], iconAnchor: [12, 12],
+          html: `<div class="lt-pin ${t.simulated ? "lt-sim" : ""} ${sel ? "lt-sel" : ""}" style="--c:${c}"><div class="lt-dot">${inner}</div><div class="lt-label">${ltEsc(t.number)}${shortDelay}</div></div>`
+        });
+      }
+
+      function ltStatusText(t, loc) {
+        if (!loc) return "—";
+        switch (loc.state) {
+          case "moving": return `${loc.from} → ${loc.to}${loc.speed ? " · " + Math.round(loc.speed) + " km/h" : ""}`;
+          case "station": return `At ${loc.code}`;
+          case "upcoming": return `Enters map at ${loc.at} ~${ltTime(loc.next.arr)}`;
+          case "exited": return "Left the mapped network";
+          case "cancelled": return "Cancelled";
+          default: return loc.reason || "Not on mapped network";
+        }
+      }
+
+      function ltPopupHtml(id) {
+        const t = ltTrains.get(id), loc = ltLocs.get(id);
+        if (!t || !loc) return "";
+        const badge = t.simulated
+          ? `<span style="background:#7c3aed;color:#fff;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:700;">SIMULATED</span>`
+          : `<span style="background:#059669;color:#fff;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:700;">LIVE FEED</span>`;
+        const nx = loc.next ? `${ltEsc(loc.next.code)} · ${ltTime(loc.next.arr)}` : "—";
+        const age = t.simulated ? "" : `<div><strong>Feed updated:</strong> ${Math.max(0, Math.round((Date.now() - t.updatedAt) / 60000))} min ago</div>`;
+        const btn = "border:0;border-radius:6px;padding:3px 8px;font-size:11px;font-weight:600;cursor:pointer;color:#fff;";
+        return `<div style="min-width:210px;font-size:12px;line-height:1.5;color:#0f172a;">
+          <div style="font-weight:800;font-size:13px;">${ltEsc(t.number)} ${badge}</div>
+          <div style="margin-bottom:4px;">${ltEsc(t.name)}</div>
+          <div><strong>Status:</strong> ${ltEsc(ltStatusText(t, loc))}</div>
+          <div><strong>Delay:</strong> ${ltEsc(ltDelayTxt(t))}</div>
+          <div><strong>Next on map:</strong> ${nx}</div>
+          ${t.dest ? `<div><strong>Destination:</strong> ${ltEsc(t.dest)}</div>` : ""}
+          <div><strong>Position basis:</strong> ${ltEsc(loc.mode || "—")}</div>
+          ${age}
+          <div style="display:flex;gap:6px;margin-top:8px;flex-wrap:wrap;">
+            <button data-lt-act="follow" data-lt-id="${ltEsc(id)}" style="${btn}background:#059669;">${ltFollow === id ? "Unfollow" : "Follow"}</button>
+            <button data-lt-act="route" data-lt-id="${ltEsc(id)}" style="${btn}background:#2563eb;">Open in route tracker</button>
+          </div></div>`;
+      }
+
+      function ltDrawPath(id) {
+        ltPathLayer.clearLayers();
+        const t = ltTrains.get(id); if (!t) return;
+        const K = ltKnownStops(t); const pts = [];
+        for (let i = 0; i < K.length - 1; i++) {
+          const g = ltTrackBetween(K[i].code, K[i + 1].code);
+          if (g.ok) g.pts.forEach(p => pts.push([p.lat, p.lon]));
+        }
+        if (pts.length > 1) L.polyline(pts, { pane: "selectedRoutePane", color: "#38bdf8", weight: 5, opacity: 0.85, dashArray: "2 9", lineCap: "round", interactive: false }).addTo(ltPathLayer);
+      }
+      function ltSelect(id, fly) {
+        ltSelected = id;
+        ltDrawPath(id);
+        const m = ltMarkers.get(id);
+        if (m) { if (fly) map.flyTo(m.marker.getLatLng(), Math.max(map.getZoom(), 11), { duration: 0.8 }); m.marker.openPopup(); }
+        else if (fly) showToast("This train is not on the mapped network right now");
+      }
+
+      // ---------------- 1-second render tick ----------------
+      let ltTickN = 0;
+      function ltTick() {
+        const now = Date.now();
+        if (ltCfg.provider === "demo" && now - ltDemoBuiltAt > 10000) ltSetTrains(ltDemoTrains(now));
+        let shown = 0;
+        ltTrains.forEach((t, id) => {
+          const loc = ltLocate(t, now);
+          ltLocs.set(id, loc);
+          if (loc.lat === undefined) {
+            const m = ltMarkers.get(id); if (m) { ltLayer.removeLayer(m.marker); ltMarkers.delete(id); }
+            return;
+          }
+          shown++;
+          const sel = ltSelected === id;
+          const sig = `${Math.round((loc.bearing || 0) / 15)}|${loc.bearing == null}|${Math.round(t.delayMin || 0)}|${sel}|${loc.state}`;
+          let m = ltMarkers.get(id);
+          if (!m) {
+            const marker = L.marker([loc.lat, loc.lon], { pane: "trainPane", icon: ltMakeIcon(t, loc, sel), riseOnHover: true });
+            marker.bindPopup(() => ltPopupHtml(id), { maxWidth: 300 });
+            marker.on("click", () => { ltSelected = id; ltDrawPath(id); });
+            marker.addTo(ltLayer);
+            m = { marker, sig }; ltMarkers.set(id, m);
+          } else {
+            m.marker.setLatLng([loc.lat, loc.lon]);
+            if (m.sig !== sig) { m.marker.setIcon(ltMakeIcon(t, loc, sel)); m.sig = sig; }
+            if (m.marker.isPopupOpen()) m.marker.setPopupContent(ltPopupHtml(id));
+          }
+          if (ltFollow === id) map.panTo([loc.lat, loc.lon], { animate: true, duration: 1 });
+        });
+        ltMarkers.forEach((m, id) => { if (!ltTrains.has(id)) { ltLayer.removeLayer(m.marker); ltMarkers.delete(id); } });
+        $lt("ltCount").textContent = shown;
+        if (++ltTickN % 3 === 0) ltRenderList();
+      }
+
+      function ltSetTrains(list) {
+        const seen = new Set();
+        (Array.isArray(list) ? list : []).forEach(t => {
+          if (!t || !t.id) return;
+          ltTrains.set(String(t.id), t);
+          seen.add(String(t.id));
+        });
+        if (ltCfg.provider === "demo" || ltCfg.provider === "network") {
+          [...ltTrains.keys()].forEach(id => { if (!seen.has(id)) ltTrains.delete(id); });
+        }
+        ltDemoBuiltAt = Date.now();
+      }
+
+      // ---------------- live polling ----------------
+      function ltBumpUsage() {
+        const m = new Date().toISOString().slice(0, 7);
+        if (ltCfg.usage.m !== m) ltCfg.usage = { m, n: 0 };
+        ltCfg.usage.n++; ltSave();
+      }
+      async function ltFetchNetwork() {
+        if (Array.isArray(window.__PRELOADED_LIVE_TRAINS__)) {
+          return window.__PRELOADED_LIVE_TRAINS__;
+        }
+        const url = (ltCfg.networkUrl || "").trim();
+        if (!url) throw new Error("Set your Live Network Feed URL in settings");
+        const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), 18000);
+        let resp;
+        try { resp = await fetch(url, { signal: ctl.signal }); }
+        catch (e) { throw new Error("Cannot reach feed (" + url + ") — start live_network_server.py or set deployed URL"); }
+        finally { clearTimeout(to); }
+        if (!resp.ok) throw new Error("Feed error HTTP " + resp.status);
+        const json = await resp.json();
+        const list = Array.isArray(json) ? json : (Array.isArray(json && json.trains) ? json.trains : (Array.isArray(json && json.data) ? json.data : null));
+        if (!list) throw new Error("Unexpected feed JSON — expected array or { trains: [...] }");
+        return list;
+      }
+      function ltNormalizeRapidApi(json, fallbackNo) {
+        const d = json && json.data;
+        if (!d || !Array.isArray(d.stations)) return ltNormalizeRailRadar(json);
+        const now = Date.now();
+        const today = new Date();
+        const stops = [];
+        let prev = -Infinity;
+        d.stations.forEach(s => {
+          const code = (s.station_code || s.code || "").trim().toUpperCase();
+          if (!code) return;
+          const parseHm = hm => {
+            if (!hm || !/^\\d{1,2}:\\d{2}$/.test(hm.trim())) return null;
+            const [hh, mm] = hm.trim().split(":").map(Number);
+            const dt = new Date(today.getFullYear(), today.getMonth(), today.getDate(), hh, mm, 0, 0);
+            return dt.getTime();
+          };
+          let arr = parseHm(s.arrival), dep = parseHm(s.departure);
+          if (arr === null) arr = dep;
+          if (dep === null) dep = arr;
+          if (arr === null) return;
+          arr += (Number(s.arrival_delay_minutes) || 0) * 60000;
+          dep += (Number(s.departure_delay_minutes) || 0) * 60000;
+          if (arr < prev) arr += 86400000;
+          if (dep < arr) dep = arr;
+          prev = dep;
+          stops.push({ code, name: s.station_name || code, arr, dep, halt: true });
+        });
+        const curCode = (d.current_station || "").trim().toUpperCase();
+        const isAt = /arrived|at/i.test(d.position || "");
+        return {
+          id: String(d.train_no || fallbackNo),
+          number: String(d.train_no || fallbackNo),
+          name: d.train_name || String(fallbackNo),
+          status: d.position || "running",
+          delayMin: Number(d.delay_minutes) || 0,
+          updatedAt: now,
+          stops,
+          loc: curCode ? { stationCode: curCode, status: isAt ? "at-station" : "departed", distanceFromLastStationKm: 0, speedKmh: 0 } : null,
+          source: "live"
+        };
+      }
+      async function ltFetchLive(no) {
+        if (!ltCfg.apiKey) throw new Error("Add your API key in Settings");
+        const isRapid = ltCfg.authStyle === "rapidapi";
+        const base = (isRapid && ltCfg.baseUrl === "https://api.railradar.in")
+          ? "https://irctc-indian-railway-pnr-status.p.rapidapi.com"
+          : ltCfg.baseUrl.replace(/\\/+$/, "");
+        let url = isRapid
+          ? `${base}/live-train/${encodeURIComponent(no)}/status`
+          : `${base}/v1/trains/${encodeURIComponent(no)}/live`;
+        const opt = { headers: {} };
+        if (isRapid) {
+          opt.headers["x-rapidapi-key"] = ltCfg.apiKey;
+          opt.headers["x-rapidapi-host"] = new URL(base).host;
+        } else if (ltCfg.authStyle === "query") {
+          url += `?apiKey=${encodeURIComponent(ltCfg.apiKey)}`;
+        } else {
+          opt.headers["Authorization"] = "Bearer " + ltCfg.apiKey;
+        }
+        const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), 15000); opt.signal = ctl.signal;
+        ltBumpUsage();
+        let resp;
+        try { resp = await fetch(url, opt); }
+        catch (e) { throw new Error("Network/CORS blocked — call the API through your own backend (set Base URL)"); }
+        finally { clearTimeout(to); }
+        let json = null; try { json = await resp.json(); } catch (e) {}
+        if (!resp.ok || (json && json.success === false)) {
+          const code = json && json.error && (json.error.code || json.error.message);
+          if (resp.status === 401 || resp.status === 403) throw new Error("API key rejected / plan limit (" + (code || resp.status) + ")");
+          if (resp.status === 404) throw new Error("Train number not found");
+          if (resp.status === 422) throw new Error("Not running on this date");
+          if (resp.status === 429) throw new Error("Rate limit reached — try later");
+          throw new Error("API error " + resp.status + (code ? " · " + code : ""));
+        }
+        return isRapid ? ltNormalizeRapidApi(json, no) : ltNormalizeRailRadar(json);
+      }
+      async function ltPollAll(force) {
+        if (ltPollBusy) return;
+        if (!force && document.hidden) return;
+        ltPollBusy = true; ltSetStatus("Updating…");
+        try {
+          if (ltCfg.provider === "demo") {
+            ltNetworkError = "";
+            ltSetTrains(ltDemoTrains(Date.now()));
+          } else if (ltCfg.provider === "network") {
+            try {
+              const list = await ltFetchNetwork();
+              ltNetworkError = "";
+              ltSetTrains(list);
+            } catch (e) {
+              ltNetworkError = e.message;
+            }
+          } else {
+            ltNetworkError = "";
+            for (let i = 0; i < ltCfg.trains.length; i++) {
+              const no = ltCfg.trains[i];
+              try { ltTrains.set(no, await ltFetchLive(no)); ltErrors.delete(no); }
+              catch (e) { ltErrors.set(no, e.message); }
+              ltRenderList();
+              if (i < ltCfg.trains.length - 1) await ltSleep(1200); // stay under per-minute burst limits
+            }
+          }
+          ltLastPoll = Date.now();
+        } finally { ltPollBusy = false; ltSyncSettingsUi(); ltTick(); }
+      }
+      function ltStartTimer() {
+        clearInterval(ltPollTimer); ltPollTimer = null;
+        if (ltCfg.provider !== "demo") ltPollTimer = setInterval(() => ltPollAll(false), Math.max(1, ltCfg.intervalMin) * 60000);
+      }
+
+      // ---------------- panel UI ----------------
+      function ltSetStatus(msg) {
+        const el = $lt("ltStatus"); if (!el) return;
+        if (msg) { el.textContent = msg; return; }
+        if (ltCfg.provider === "demo") el.textContent = "Simulated · runs locally";
+        else if (ltCfg.provider === "network") el.textContent = ltNetworkError ? "Feed offline" : (ltLastPoll ? "Live Network · " + ltTime(ltLastPoll) + " IST" : "Connecting…");
+        else el.textContent = ltLastPoll ? "Last update " + ltTime(ltLastPoll) + " IST" : "Waiting for first update";
+      }
+      function ltRenderList() {
+        if ($lt("liveTrainsPanel").classList.contains("hidden")) return;
+        const ids = (ltCfg.provider === "demo" || ltCfg.provider === "network") ? [...ltTrains.keys()] : ltCfg.trains;
+        const box = $lt("ltList");
+        if (!ids.length) {
+          const emptyMsg = ltCfg.provider === "network"
+            ? (ltNetworkError ? "No trains loaded while feed is offline." : "No running trains reported on the mapped network right now.")
+            : "No trains yet. Add a train number above.";
+          box.innerHTML = `<div class="text-[11px] text-slate-400 px-1 py-2">${emptyMsg}</div>`;
+          return;
+        }
+        box.innerHTML = ids.map(id => {
+          const t = ltTrains.get(id), loc = ltLocs.get(id), err = ltErrors.get(id);
+          const c = t ? ltDelayColor(t, loc) : "#64748b";
+          const status = err ? `<span class="text-rose-300">${ltEsc(err)}</span>` : (t ? ltEsc(ltStatusText(t, loc)) : "Loading…");
+          const del = t && !err ? `<span class="font-bold shrink-0" style="color:${c}">${ltEsc(ltDelayTxt(t))}</span>` : "";
+          const rm = (ltCfg.provider === "demo" || ltCfg.provider === "network") ? "" : `<button data-lt-act="remove" data-lt-id="${ltEsc(id)}" class="text-slate-500 hover:text-rose-400 px-1 cursor-pointer" title="Remove">✕</button>`;
+          return `<div class="lt-row flex items-start gap-2 rounded-lg px-1.5 py-1.5 border-b border-slate-800" data-lt-id="${ltEsc(id)}">
+            <span class="w-2.5 h-2.5 rounded-full mt-1 shrink-0" style="background:${c}"></span>
+            <div class="min-w-0 flex-1"><div class="flex items-center justify-between gap-2"><span class="font-semibold text-slate-100 truncate">${ltEsc(id)}${t ? " · " + ltEsc(t.name) : ""}</span>${del}</div>
+            <div class="text-[10px] text-slate-400 truncate">${status}</div></div>${rm}</div>`;
+        }).join("");
+      }
+      function ltSyncSettingsUi() {
+        const isNet = ltCfg.provider === "network";
+        const isDemo = ltCfg.provider === "demo";
+        const isLive = ltCfg.provider === "live";
+        $lt("ltProvider").value = ltCfg.provider;
+        $lt("ltNetworkBox").classList.toggle("hidden", !isNet);
+        $lt("ltDemoNote").classList.toggle("hidden", !isDemo);
+        $lt("ltLiveBox").classList.toggle("hidden", !isLive);
+        $lt("ltNetworkUrl").value = ltCfg.networkUrl || "";
+        $lt("ltNetInterval").value = String(ltCfg.intervalMin);
+        $lt("ltNetworkErr").classList.toggle("hidden", !(isNet && ltNetworkError));
+        if (isNet && ltNetworkError) $lt("ltNetworkErrMsg").textContent = ltNetworkError;
+        $lt("ltBase").value = ltCfg.baseUrl; $lt("ltKey").value = ltCfg.apiKey;
+        $lt("ltAuth").value = ltCfg.authStyle; $lt("ltInterval").value = String(ltCfg.intervalMin);
+        const u = ltCfg.usage.m === new Date().toISOString().slice(0, 7) ? ltCfg.usage.n : 0;
+        $lt("ltUsage").textContent = isLive ? `API calls this month (this browser): ${u}` : "";
+        ltSetStatus(); ltRenderList();
+      }
+      function ltAddTrain() {
+        const inp = $lt("ltAddInput"); const no = inp.value.trim().toUpperCase();
+        if (!no) return;
+        if (!/^[0-9A-Z _\\/-]{1,20}$/.test(no)) { showToast("Invalid train number"); return; }
+        if (!ltCfg.trains.includes(no)) { ltCfg.trains.push(no); ltSave(); }
+        inp.value = ""; ltRenderList(); ltPollAll(true);
+      }
+      function ltSwitchProvider(p) {
+        ltCfg.provider = p; ltNetworkError = ""; ltSave();
+        ltTrains.clear(); ltLocs.clear(); ltErrors.clear(); ltPathLayer.clearLayers();
+        ltMarkers.forEach(m => ltLayer.removeLayer(m.marker)); ltMarkers.clear();
+        ltSyncSettingsUi(); ltStartTimer(); ltPollAll(true);
+      }
+
+      $lt("liveTrainsBtn").addEventListener("click", () => { $lt("liveTrainsPanel").classList.toggle("hidden"); ltRenderList(); });
+      $lt("ltClose").addEventListener("click", () => $lt("liveTrainsPanel").classList.add("hidden"));
+      $lt("ltProvider").addEventListener("change", e => ltSwitchProvider(e.target.value));
+      $lt("ltNetworkUrl").addEventListener("change", e => { ltCfg.networkUrl = e.target.value.trim(); ltSave(); ltPollAll(true); });
+      $lt("ltNetInterval").addEventListener("change", e => { ltCfg.intervalMin = Number(e.target.value) || 3; ltSave(); ltStartTimer(); });
+      $lt("ltRetryNetBtn").addEventListener("click", () => ltPollAll(true));
+      $lt("ltSwitchDemoBtn").addEventListener("click", () => ltSwitchProvider("demo"));
+      $lt("ltAddBtn").addEventListener("click", ltAddTrain);
+      $lt("ltAddInput").addEventListener("keydown", e => { if (e.key === "Enter") ltAddTrain(); });
+      $lt("ltRefresh").addEventListener("click", () => ltPollAll(true));
+      $lt("ltBase").addEventListener("change", e => { ltCfg.baseUrl = e.target.value.trim() || "https://api.railradar.in"; ltSave(); });
+      $lt("ltKey").addEventListener("change", e => { ltCfg.apiKey = e.target.value.trim(); ltSave(); ltErrors.clear(); ltPollAll(true); });
+      $lt("ltAuth").addEventListener("change", e => { ltCfg.authStyle = e.target.value; ltSave(); });
+      $lt("ltInterval").addEventListener("change", e => { ltCfg.intervalMin = Number(e.target.value) || 3; ltSave(); ltStartTimer(); });
+
+      document.addEventListener("click", e => {
+        const act = e.target.closest("[data-lt-act]");
+        if (act) {
+          const id = act.getAttribute("data-lt-id"), a = act.getAttribute("data-lt-act");
+          if (a === "remove") { ltCfg.trains = ltCfg.trains.filter(x => x !== id); ltTrains.delete(id); ltErrors.delete(id); ltSave(); ltTick(); ltRenderList(); return; }
+          if (a === "follow") { ltFollow = (ltFollow === id) ? null : id; const m = ltMarkers.get(id); if (m) m.marker.setPopupContent(ltPopupHtml(id)); return; }
+          if (a === "route") {
+            const t = ltTrains.get(id), loc = ltLocs.get(id); if (!t || !loc) return;
+            const K = ltKnownStops(t); const from = loc.from || loc.code, to = K[K.length - 1].code;
+            if (!from || from === to) { showToast("Train is at the end of its mapped route"); return; }
+            fromStationSelect.value = from; toStationSelect.value = to;
+            if (fromStationSelect.value !== from || toStationSelect.value !== to) { showToast("Route stations unavailable in selector"); return; }
+            $lt("simCorridorSelect").value = "custom";
+            onCustomStationRouteChange(true);
+            showToast(`Route tracker set: ${from} → ${to}`);
+          }
+          return;
+        }
+        const row = e.target.closest(".lt-row[data-lt-id]");
+        if (row) ltSelect(row.getAttribute("data-lt-id"), true);
+      });
+      map.on("dragstart", () => { ltFollow = null; });
+      map.on("zoomend", () => { map.getContainer().classList.toggle("lt-lowzoom", map.getZoom() < 8); });
+      map.on("popupclose", () => { ltPathLayer.clearLayers(); ltSelected = null; });
+      document.addEventListener("visibilitychange", () => { if (!document.hidden && ltCfg.provider !== "demo" && Date.now() - ltLastPoll > ltCfg.intervalMin * 60000) ltPollAll(false); });
+
+      // Public hooks so the rest of your project can plug in its own feed
+      window.RailLiveTrains = {
+        config: ltCfg,
+        aliases: ltAlias,                         // e.g. RailLiveTrains.aliases["XYZ"] = "SUR"
+        setTrains: list => { ltSetTrains(list); ltTick(); },   // push normalized trains from your own backend / websocket
+        locate: (train, now) => ltLocate(train, now || Date.now()),
+        refresh: () => ltPollAll(true)
+      };
+
+      ltSyncSettingsUi();
+      ltStartTimer();
+      ltPollAll(true);
+      setInterval(ltTick, 1000);
+      if (window.innerWidth >= 900) $lt("liveTrainsPanel").classList.remove("hidden");
+
+    })();
+  </script>
+</body>
+</html>
+"""
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
