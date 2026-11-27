@@ -186,23 +186,24 @@ def _normalize_from_live_status(train_no: str, fallback_name: str, live: Dict[st
     }
 
 
-def _fetch_board(stn: str) -> List[tuple]:
-    client = NTESClient(timeout=6, retries=1)
+def _fetch_board(stn: str) -> tuple:
+    client = NTESClient(timeout=10, retries=2)
     out = []
+    err = None
     try:
-        board = client.station_live(stn, hours=2) or {}
+        board = client.station_live(stn, hours=4) or {}
         entries = board.get("TrainsAtStation") or board.get("trains") or []
         for item in entries:
             tno = str(item.get("TrainNumber") or item.get("trainNumber") or "").strip()
             if tno:
                 out.append((tno, str(item.get("TrainName") or item.get("trainName") or tno).strip()))
-    except Exception:
-        pass
-    return out
+    except Exception as exc:
+        err = f"{stn}: {exc}"
+    return out, err
 
 
 def _fetch_one_train(tno: str, name: str) -> Optional[Dict[str, Any]]:
-    client = NTESClient(timeout=6, retries=1)
+    client = NTESClient(timeout=10, retries=2)
     try:
         start_date = _pick_active_start_date(client, tno)
         live = client.live_status(tno, start_date) or {}
@@ -212,27 +213,30 @@ def _fetch_one_train(tno: str, name: str) -> Optional[Dict[str, Any]]:
 
 
 @st.cache_data(ttl=180, show_spinner="Fetching live NTES trains across Solapur Division...")
-def fetch_live_network_trains() -> List[Dict[str, Any]]:
+def fetch_live_network_trains() -> Dict[str, Any]:
     if NTESClient is None:
-        return []
+        return {"trains": [], "board_count": 0, "errors": ["ntes-client not installed"]}
     seen: Dict[str, str] = {}
-    with ThreadPoolExecutor(max_workers=7) as pool:
-        for rows in pool.map(_fetch_board, JUNCTIONS):
+    errors: List[str] = []
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        for rows, err in pool.map(_fetch_board, JUNCTIONS):
+            if err:
+                errors.append(err)
             for tno, name in rows:
                 if tno not in seen:
                     seen[tno] = name
 
     if not seen:
-        return []
+        return {"trains": [], "board_count": 0, "errors": errors}
 
     trains: List[Dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=8) as pool:
+    with ThreadPoolExecutor(max_workers=3) as pool:
         futures = [pool.submit(_fetch_one_train, tno, name) for tno, name in seen.items()]
         for fut in as_completed(futures):
             res = fut.result()
             if res:
                 trains.append(res)
-    return trains
+    return {"trains": trains, "board_count": len(seen), "errors": errors}
 
 
 col1, col2 = st.columns([5, 1])
@@ -240,11 +244,16 @@ with col2:
     if st.button("Refresh Live Trains", use_container_width=True):
         fetch_live_network_trains.clear()
 
-trains = fetch_live_network_trains()
+if NTESClient is None:
+    st.error("`ntes-client` is not installed in this Python environment. Run: `pip install ntes-client`")
+
+res_data = fetch_live_network_trains()
+trains = res_data["trains"]
 with col1:
+    err_note = f" · Errors: {'; '.join(res_data['errors'][:2])}" if res_data["errors"] else ""
     st.caption(
-        f"Live NTES Feed · {len(trains)} trains loaded across {', '.join(JUNCTIONS)} · "
-        f"Updated {datetime.now(IST).strftime('%H:%M:%S IST')}"
+        f"Live NTES Feed · {len(trains)}/{res_data['board_count']} trains loaded across {', '.join(JUNCTIONS)} · "
+        f"Updated {datetime.now(IST).strftime('%H:%M:%S IST')}{err_note}"
     )
 
 html_path = Path(__file__).parent / "railway_network_map.html"
