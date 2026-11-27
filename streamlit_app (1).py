@@ -195,7 +195,7 @@ def _normalize_from_live_status(train_no: str, fallback_name: str, live: Dict[st
 
 
 def _fetch_board(stn: str) -> tuple:
-    client = NTESClient(timeout=10, retries=2)
+    client = NTESClient(timeout=4, retries=0)
     out = []
     err = None
     try:
@@ -211,7 +211,7 @@ def _fetch_board(stn: str) -> tuple:
 
 
 def _fetch_one_train(tno: str, name: str) -> Optional[Dict[str, Any]]:
-    client = NTESClient(timeout=10, retries=2)
+    client = NTESClient(timeout=4, retries=0)
     try:
         start_date = _pick_active_start_date(client, tno)
         live = client.live_status(tno, start_date) or {}
@@ -257,15 +257,16 @@ def fetch_live_network_trains() -> Dict[str, Any]:
                     seen[tno] = name
 
     if not seen:
-        if _ctkt_mod is not None:
-            try:
-                ct_res = asyncio.run(_fetch_confirmtkt_async())
-                if ct_res["trains"]:
-                    return ct_res
-                errors.extend(ct_res["errors"])
-            except Exception as exc:
-                errors.append(f"ConfirmTkt: {exc}")
-        return {"trains": [], "board_count": 0, "errors": errors}
+        if _ctkt_mod is None:
+            return {"trains": [], "board_count": 0, "errors": ["MultiFeatures not installed (check requirements.txt)"] + errors}
+        try:
+            ct_res = asyncio.run(_fetch_confirmtkt_async())
+            if ct_res["trains"]:
+                return ct_res
+            diag = f"ConfirmTkt: found {ct_res['board_count']} trains, 0 parsed"
+            return {"trains": [], "board_count": ct_res["board_count"], "errors": [diag] + ct_res["errors"][:2]}
+        except Exception as exc:
+            return {"trains": [], "board_count": 0, "errors": [f"ConfirmTkt error: {exc}"]}
 
     trains: List[Dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=3) as pool:
