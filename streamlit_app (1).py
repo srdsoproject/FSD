@@ -9,6 +9,7 @@ Run locally:
   streamlit run streamlit_app.py
 """
 
+import asyncio
 import json
 import os
 import re
@@ -26,6 +27,11 @@ try:
     from ntes import NTESClient
 except ImportError:
     NTESClient = None
+
+try:
+    from MultiFeatures.IndianRailway import confirmtkt as _ctkt_mod
+except ImportError:
+    _ctkt_mod = None
 
 IST = timezone(timedelta(hours=5, minutes=30))
 JUNCTIONS = ["WADI", "KLBG", "SUR", "KWV", "DD", "MRJ", "LUR"]
@@ -214,9 +220,6 @@ def _fetch_one_train(tno: str, name: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-DEFAULT_FEED_URL = "https://hollow-secretary-partner-trinity.trycloudflare.com/api/live-network"
-
-
 def _get_remote_feed_url() -> str:
     try:
         if "LIVE_NETWORK_URL" in st.secrets:
@@ -225,7 +228,7 @@ def _get_remote_feed_url() -> str:
                 return val
     except Exception:
         pass
-    return os.environ.get("LIVE_NETWORK_URL", "").strip() or DEFAULT_FEED_URL
+    return os.environ.get("LIVE_NETWORK_URL", "").strip()
 
 
 @st.cache_data(ttl=180, show_spinner="Fetching live NTES trains across Solapur Division...")
@@ -254,6 +257,14 @@ def fetch_live_network_trains() -> Dict[str, Any]:
                     seen[tno] = name
 
     if not seen:
+        if _ctkt_mod is not None:
+            try:
+                ct_res = asyncio.run(_fetch_confirmtkt_async())
+                if ct_res["trains"]:
+                    return ct_res
+                errors.extend(ct_res["errors"])
+            except Exception as exc:
+                errors.append(f"ConfirmTkt: {exc}")
         return {"trains": [], "board_count": 0, "errors": errors}
 
     trains: List[Dict[str, Any]] = []
@@ -263,6 +274,102 @@ def fetch_live_network_trains() -> Dict[str, Any]:
             res = fut.result()
             if res:
                 trains.append(res)
+    return {"trains": trains, "board_count": len(seen), "errors": errors}
+
+
+def _parse_ctkt_time_ms(val: Any, ref_dt: datetime) -> Optional[int]:
+    if not val or not isinstance(val, str):
+        return None
+    s = val.strip()
+    m = re.search(r"(\d{1,2}:\d{2})", s)
+    if not m:
+        return None
+    try:
+        hh, mm = map(int, m.group(1).split(":"))
+        dt = ref_dt.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        return int(dt.timestamp() * 1000)
+    except Exception:
+        return None
+
+
+async def _fetch_confirmtkt_async() -> Dict[str, Any]:
+    if _ctkt_mod is None:
+        return {"trains": [], "board_count": 0, "errors": ["MultiFeatures not installed"]}
+    client = _ctkt_mod.Confirmtkt()
+    now_ist = datetime.now(IST)
+    today_str = now_ist.strftime("%d-%m-%Y")
+    yest_str = (now_ist - timedelta(days=1)).strftime("%d-%m-%Y")
+    pairs = [("WADI", "SUR"), ("SUR", "KWV"), ("KWV", "DD"), ("MRJ", "KWV"), ("KWV", "LUR"), ("KLBG", "SUR")]
+
+    seen: Dict[str, str] = {}
+    errors: List[str] = []
+    for src, dst in pairs:
+        try:
+            res = await client.available_trains(src, dst, today_str)
+            if isinstance(res, dict):
+                for t in (res.get("trains") or res.get("Trains") or []):
+                    tno = str(t.get("trainNumber") or t.get("TrainNumber") or t.get("number") or "").strip()
+                    if tno and tno not in seen:
+                        seen[tno] = str(t.get("trainName") or t.get("TrainName") or tno).strip()
+        except Exception as exc:
+            errors.append(f"{src}-{dst}: {exc}")
+
+    trains: List[Dict[str, Any]] = []
+    for tno, tname in list(seen.items())[:25]:
+        for doj in (today_str, yest_str):
+            try:
+                raw = await client.live_train_status(tno, doj)
+                if not isinstance(raw, dict):
+                    continue
+                data = raw.get("data") if isinstance(raw.get("data"), dict) else raw
+                raw_stops = (
+                    data.get("Schedule") or data.get("schedule")
+                    or data.get("Stations") or data.get("stations")
+                    or data.get("Route") or data.get("route") or []
+                )
+                if not isinstance(raw_stops, list) or not raw_stops:
+                    continue
+                stops = []
+                prev_ts = -1
+                ref_dt = now_ist if doj == today_str else (now_ist - timedelta(days=1))
+                for st_row in raw_stops:
+                    code = str(st_row.get("StationCode") or st_row.get("stationCode") or st_row.get("code") or "").strip().upper()
+                    if not code:
+                        continue
+                    arr = _parse_ctkt_time_ms(st_row.get("ActualArrival") or st_row.get("ArrivalTime") or st_row.get("arrival"), ref_dt)
+                    dep = _parse_ctkt_time_ms(st_row.get("ActualDeparture") or st_row.get("DepartureTime") or st_row.get("departure"), ref_dt)
+                    if arr is None and dep is None:
+                        continue
+                    if arr is None:
+                        arr = dep
+                    if dep is None:
+                        dep = arr
+                    while arr < prev_ts:
+                        arr += 86400000
+                    if dep < arr:
+                        dep = arr
+                    prev_ts = dep
+                    stops.append({"code": code, "name": st_row.get("StationName") or code, "arr": arr, "dep": dep, "halt": True})
+                if not stops:
+                    continue
+                cur_stn = str(data.get("CurrentStation") or data.get("currentStation") or data.get("LastStationCode") or "").strip().upper()
+                delay_min = _parse_delay_minutes(data.get("DelayMinutes") or data.get("Delay") or 0)
+                loc_obj = {"stationCode": cur_stn, "status": "at-station", "distanceFromLastStationKm": 0, "speedKmh": 0} if cur_stn else None
+                trains.append({
+                    "id": tno,
+                    "number": tno,
+                    "name": data.get("TrainName") or tname,
+                    "status": str(data.get("Status") or data.get("Message") or "running"),
+                    "delayMin": delay_min,
+                    "updatedAt": int(time.time() * 1000),
+                    "stops": stops,
+                    "loc": loc_obj,
+                    "source": "live",
+                })
+                break
+            except Exception:
+                continue
+
     return {"trains": trains, "board_count": len(seen), "errors": errors}
 
 
