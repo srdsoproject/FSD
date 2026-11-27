@@ -302,17 +302,24 @@ async def _fetch_confirmtkt_async() -> Dict[str, Any]:
     yest_str = (now_ist - timedelta(days=1)).strftime("%d-%m-%Y")
     pairs = [
         ("WADI", "SUR"), ("SUR", "WADI"),
+        ("WADI", "KLBG"), ("KLBG", "WADI"),
+        ("KLBG", "SUR"), ("SUR", "KLBG"),
         ("SUR", "KWV"), ("KWV", "SUR"),
         ("KWV", "DD"), ("DD", "KWV"),
+        ("SUR", "DD"), ("DD", "SUR"),
+        ("WADI", "DD"), ("DD", "WADI"),
         ("MRJ", "KWV"), ("KWV", "MRJ"),
+        ("MRJ", "PVR"), ("PVR", "MRJ"),
         ("KWV", "LUR"), ("LUR", "KWV"),
+        ("LUR", "LTRR"), ("LTRR", "LUR"),
+        ("KLBG", "TJSP"), ("TJSP", "KLBG"),
         ("KLBG", "BIDR"), ("BIDR", "KLBG"),
     ]
 
     seen: Dict[str, str] = {}
     errors: List[str] = []
     avail_sample_keys = ""
-    pair_sem = asyncio.Semaphore(6)
+    pair_sem = asyncio.Semaphore(14)
 
     async def _fetch_pair(src: str, dst: str):
         async with pair_sem:
