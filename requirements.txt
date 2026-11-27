@@ -1,0 +1,7 @@
+streamlit
+
+ntes-client
+
+fastapi
+
+uvicorn
