@@ -252,18 +252,12 @@ if not html_path.exists():
     st.error("Place `railway_network_map.html` in the same folder as `streamlit_app.py`.")
 else:
     html_text = html_path.read_text(encoding="utf-8")
-    # Inject live trains directly into the embedded map so it works for anyone opening the shared link
+    # Inject live trains into <head> before the map script initializes
     inject_script = f"""
     <script>
-      window.addEventListener("load", function () {{
-        if (window.RailLiveTrains) {{
-          window.RailLiveTrains.config.provider = "network";
-          window.RailLiveTrains.config.networkUrl = "";
-          window.RailLiveTrains.setTrains({json.dumps(trains)});
-        }}
-      }});
+      window.__PRELOADED_LIVE_TRAINS__ = {json.dumps(trains)};
     </script>
-    </body>
+    </head>
     """
-    html_text = html_text.replace("</body>", inject_script, 1)
+    html_text = html_text.replace("</head>", inject_script, 1)
     components.html(html_text, height=820, scrolling=False)
