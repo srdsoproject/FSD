@@ -443,9 +443,47 @@ async def _fetch_confirmtkt_async() -> Dict[str, Any]:
                     ).strip().upper()
                     if not stops:
                         continue
-                    delay_min = _parse_delay_minutes(
-                        data.get("delay") or data.get("DelayMinutes") or data.get("Delay") or 0
+
+                    # Extract delay from top-level fields OR from the current/latest stop in ConfirmTkt's station list
+                    raw_delay = (
+                        data.get("delay") or data.get("delayInMinutes") or data.get("delayMinutes")
+                        or data.get("DelayMinutes") or data.get("Delay") or data.get("lateBy")
+                        or data.get("curStnDelay") or data.get("totalDelay") or data.get("delayStr")
                     )
+                    delay_min = _parse_delay_minutes(raw_delay)
+                    raw_stop_list = []
+                    for sk in ("Schedule", "schedule", "Stations", "stations", "stationList", "Route", "route", "stops"):
+                        v = data.get(sk)
+                        if isinstance(v, list) and v and isinstance(v[0], dict):
+                            raw_stop_list = v
+                            break
+                    if delay_min == 0 and raw_stop_list:
+                        cur_stop_row = None
+                        for sr in raw_stop_list:
+                            sc = str(sr.get("stnCode") or sr.get("StationCode") or sr.get("stationCode") or sr.get("code") or "").strip().upper()
+                            if cur_stn and sc == cur_stn:
+                                cur_stop_row = sr
+                                break
+                        if cur_stop_row is None:
+                            for sr in reversed(raw_stop_list):
+                                if sr.get("actArr") or sr.get("actDep") or sr.get("delay") or sr.get("delayInMinutes") or sr.get("arrDelay") or sr.get("depDelay"):
+                                    cur_stop_row = sr
+                                    break
+                        if cur_stop_row:
+                            sr_delay = (
+                                cur_stop_row.get("delay") or cur_stop_row.get("delayInMinutes")
+                                or cur_stop_row.get("depDelay") or cur_stop_row.get("arrDelay")
+                                or cur_stop_row.get("delayDep") or cur_stop_row.get("delayArr")
+                                or cur_stop_row.get("lateBy") or cur_stop_row.get("Delay")
+                            )
+                            delay_min = _parse_delay_minutes(sr_delay)
+                            if delay_min == 0:
+                                sch_ms = _parse_ctkt_time_ms(cur_stop_row.get("schDep") or cur_stop_row.get("schArr") or cur_stop_row.get("sta"), ref_dt)
+                                act_ms = _parse_ctkt_time_ms(cur_stop_row.get("actDep") or cur_stop_row.get("actArr") or cur_stop_row.get("eta") or cur_stop_row.get("etd"), ref_dt)
+                                if sch_ms and act_ms:
+                                    diff_m = round((act_ms - sch_ms) / 60000)
+                                    if -60 < diff_m < 1440:
+                                        delay_min = max(0, diff_m)
                     is_departed = bool(data.get("departed"))
                     in_stops = any(s["code"] == cur_stn for s in stops)
                     next_stn = str(data.get("nextStn") or data.get("NextStationCode") or "").strip().upper()
