@@ -263,8 +263,8 @@ def fetch_live_network_trains() -> Dict[str, Any]:
             ct_res = asyncio.run(_fetch_confirmtkt_async())
             if ct_res["trains"]:
                 return ct_res
-            diag = f"ConfirmTkt: found {ct_res['board_count']} trains, 0 parsed"
-            return {"trains": [], "board_count": ct_res["board_count"], "errors": [diag] + ct_res["errors"][:2]}
+            diag = f"ConfirmTkt({ct_res['board_count']} found): " + (ct_res["errors"][0] if ct_res["errors"] else "0 parsed")
+            return {"trains": [], "board_count": ct_res["board_count"], "errors": [diag]}
         except Exception as exc:
             return {"trains": [], "board_count": 0, "errors": [f"ConfirmTkt error: {exc}"]}
 
@@ -275,8 +275,6 @@ def fetch_live_network_trains() -> Dict[str, Any]:
             res = fut.result()
             if res:
                 trains.append(res)
-    if not trains:
-        errors.insert(0, f"keys(avail=[{avail_sample_keys}], live=[{live_sample_keys}])")
     return {"trains": trains, "board_count": len(seen), "errors": errors}
 
 
@@ -391,6 +389,15 @@ async def _fetch_confirmtkt_async() -> Dict[str, Any]:
             except Exception:
                 continue
 
+    if not trains:
+        sample_info = f"live_keys=[{live_sample_keys}]"
+        try:
+            first_tno = next(iter(seen))
+            sample_raw = await client.live_train_status(first_tno, today_str)
+            sample_info = f"sample({first_tno})={str(sample_raw)[:280]}"
+        except Exception as sexc:
+            sample_info = f"sample_err={sexc}"
+        return {"trains": trains, "board_count": len(seen), "errors": [sample_info]}
     return {"trains": trains, "board_count": len(seen), "errors": errors}
 
 
