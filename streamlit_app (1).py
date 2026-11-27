@@ -283,13 +283,7 @@ with col1:
         f"Updated {datetime.now(IST).strftime('%H:%M:%S IST')}{err_note}"
     )
 
-inject_script = f"""
-<script>
-  window.__PRELOADED_LIVE_TRAINS__ = {json.dumps(trains)};
-</script>
-</head>
-"""
-components.html(MAP_HTML.replace("</head>", inject_script, 1), height=820, scrolling=False)
+
 
 MAP_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -4244,3 +4238,11 @@ MAP_HTML = """<!DOCTYPE html>
 </body>
 </html>
 """
+
+inject_script = f"""
+<script>
+  window.__PRELOADED_LIVE_TRAINS__ = {json.dumps(trains)};
+</script>
+</head>
+"""
+components.html(MAP_HTML.replace("</head>", inject_script, 1), height=820, scrolling=False)
