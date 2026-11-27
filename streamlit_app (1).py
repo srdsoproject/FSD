@@ -10,8 +10,10 @@ Run locally:
 """
 
 import json
+import os
 import re
 import time
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -212,8 +214,33 @@ def _fetch_one_train(tno: str, name: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+DEFAULT_FEED_URL = "https://hollow-secretary-partner-trinity.trycloudflare.com/api/live-network"
+
+
+def _get_remote_feed_url() -> str:
+    try:
+        if "LIVE_NETWORK_URL" in st.secrets:
+            val = str(st.secrets["LIVE_NETWORK_URL"]).strip()
+            if val:
+                return val
+    except Exception:
+        pass
+    return os.environ.get("LIVE_NETWORK_URL", "").strip() or DEFAULT_FEED_URL
+
+
 @st.cache_data(ttl=180, show_spinner="Fetching live NTES trains across Solapur Division...")
 def fetch_live_network_trains() -> Dict[str, Any]:
+    remote_url = _get_remote_feed_url()
+    if remote_url:
+        try:
+            req = urllib.request.Request(remote_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            trains = data if isinstance(data, list) else (data.get("trains") or [])
+            return {"trains": trains, "board_count": len(trains), "errors": []}
+        except Exception as exc:
+            return {"trains": [], "board_count": 0, "errors": [f"Feed URL error: {exc}"]}
+
     if NTESClient is None:
         return {"trains": [], "board_count": 0, "errors": ["ntes-client not installed"]}
     seen: Dict[str, str] = {}
