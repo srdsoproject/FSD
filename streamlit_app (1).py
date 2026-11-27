@@ -299,6 +299,7 @@ async def _fetch_confirmtkt_async() -> Dict[str, Any]:
     client = _ctkt_mod.Confirmtkt()
     now_ist = datetime.now(IST)
     today_str = now_ist.strftime("%d-%m-%Y")
+    tomorrow_str = (now_ist + timedelta(days=1)).strftime("%d-%m-%Y")
     yest_str = (now_ist - timedelta(days=1)).strftime("%d-%m-%Y")
     pairs = [
         ("WADI", "SUR"), ("SUR", "WADI"),
@@ -308,6 +309,9 @@ async def _fetch_confirmtkt_async() -> Dict[str, Any]:
         ("KWV", "DD"), ("DD", "KWV"),
         ("SUR", "DD"), ("DD", "SUR"),
         ("WADI", "DD"), ("DD", "WADI"),
+        ("PUNE", "SUR"), ("SUR", "PUNE"),
+        ("PUNE", "WADI"), ("WADI", "PUNE"),
+        ("SC", "SUR"), ("SUR", "SC"),
         ("MRJ", "KWV"), ("KWV", "MRJ"),
         ("MRJ", "PVR"), ("PVR", "MRJ"),
         ("KWV", "LUR"), ("LUR", "KWV"),
@@ -321,14 +325,16 @@ async def _fetch_confirmtkt_async() -> Dict[str, Any]:
     avail_sample_keys = ""
     pair_sem = asyncio.Semaphore(14)
 
-    async def _fetch_pair(src: str, dst: str):
+    async def _fetch_pair(src: str, dst: str, doj_str: str):
         async with pair_sem:
             try:
-                return src, dst, await client.available_trains(src, dst, today_str), None
+                return src, dst, await client.available_trains(src, dst, doj_str), None
             except Exception as exc:
                 return src, dst, None, exc
 
-    pair_results = await asyncio.gather(*[_fetch_pair(s, d) for s, d in pairs])
+    # Query BOTH today and tomorrow so trains that already departed `src` earlier today are still discovered
+    tasks = [_fetch_pair(s, d, today_str) for s, d in pairs] + [_fetch_pair(s, d, tomorrow_str) for s, d in pairs]
+    pair_results = await asyncio.gather(*tasks)
     for src, dst, res, exc in pair_results:
         if exc is not None:
             errors.append(f"{src}-{dst}: {exc}")
