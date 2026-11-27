@@ -330,74 +330,120 @@ async def _fetch_confirmtkt_async() -> Dict[str, Any]:
         for tno in ["12115", "12116", "11301", "11302", "11019", "11020", "12701", "12702", "16589", "16590", "12157", "12158", "11027", "11028", "17221", "17222"]:
             seen[tno] = tno
 
-    trains: List[Dict[str, Any]] = []
-    live_sample_keys = ""
-    for tno, tname in list(seen.items())[:25]:
-        for doj in (today_str, yest_str):
-            try:
-                raw = await client.live_train_status(tno, doj)
-                if isinstance(raw, dict) and not live_sample_keys:
-                    live_sample_keys = ",".join(list(raw.keys())[:8])
-                if not isinstance(raw, dict):
-                    continue
-                data = raw.get("data") if isinstance(raw.get("data"), dict) else raw
-                raw_stops = (
-                    data.get("Schedule") or data.get("schedule")
-                    or data.get("Stations") or data.get("stations")
-                    or data.get("Route") or data.get("route") or []
-                )
-                if not isinstance(raw_stops, list) or not raw_stops:
-                    continue
-                stops = []
-                prev_ts = -1
-                ref_dt = now_ist if doj == today_str else (now_ist - timedelta(days=1))
-                for st_row in raw_stops:
-                    code = str(st_row.get("StationCode") or st_row.get("stationCode") or st_row.get("code") or "").strip().upper()
-                    if not code:
-                        continue
-                    arr = _parse_ctkt_time_ms(st_row.get("ActualArrival") or st_row.get("ArrivalTime") or st_row.get("arrival"), ref_dt)
-                    dep = _parse_ctkt_time_ms(st_row.get("ActualDeparture") or st_row.get("DepartureTime") or st_row.get("departure"), ref_dt)
-                    if arr is None and dep is None:
-                        continue
-                    if arr is None:
-                        arr = dep
-                    if dep is None:
-                        dep = arr
-                    while arr < prev_ts:
-                        arr += 86400000
-                    if dep < arr:
-                        dep = arr
-                    prev_ts = dep
-                    stops.append({"code": code, "name": st_row.get("StationName") or code, "arr": arr, "dep": dep, "halt": True})
-                if not stops:
-                    continue
-                cur_stn = str(data.get("CurrentStation") or data.get("currentStation") or data.get("LastStationCode") or "").strip().upper()
-                delay_min = _parse_delay_minutes(data.get("DelayMinutes") or data.get("Delay") or 0)
-                loc_obj = {"stationCode": cur_stn, "status": "at-station", "distanceFromLastStationKm": 0, "speedKmh": 0} if cur_stn else None
-                trains.append({
-                    "id": tno,
-                    "number": tno,
-                    "name": data.get("TrainName") or tname,
-                    "status": str(data.get("Status") or data.get("Message") or "running"),
-                    "delayMin": delay_min,
-                    "updatedAt": int(time.time() * 1000),
-                    "stops": stops,
-                    "loc": loc_obj,
-                    "source": "live",
-                })
-                break
-            except Exception:
-                continue
+    sem = asyncio.Semaphore(10)
+    two_days_ago_str = (now_ist - timedelta(days=2)).strftime("%d-%m-%Y")
+    found_samples: List[str] = []
 
+    def _extract_stops_from_ctkt(data: Dict[str, Any], ref_dt: datetime) -> List[Dict[str, Any]]:
+        raw_stops = None
+        for k in ("Schedule", "schedule", "Stations", "stations", "stationList", "Route", "route", "stops"):
+            val = data.get(k)
+            if isinstance(val, list) and val and isinstance(val[0], dict):
+                raw_stops = val
+                break
+        if raw_stops is None:
+            for val in data.values():
+                if isinstance(val, list) and val and isinstance(val[0], dict):
+                    if any(sk in val[0] for sk in ("stnCode", "stationCode", "StationCode", "code", "SC")):
+                        raw_stops = val
+                        break
+        if not raw_stops:
+            return []
+
+        stops = []
+        prev_ts = -1
+        for st_row in raw_stops:
+            code = str(
+                st_row.get("stnCode") or st_row.get("StationCode")
+                or st_row.get("stationCode") or st_row.get("code") or st_row.get("SC") or ""
+            ).strip().upper()
+            if not code:
+                continue
+            arr = _parse_ctkt_time_ms(
+                st_row.get("actArr") or st_row.get("eta") or st_row.get("ActualArrival")
+                or st_row.get("schArr") or st_row.get("ArrivalTime") or st_row.get("arrival"),
+                ref_dt,
+            )
+            dep = _parse_ctkt_time_ms(
+                st_row.get("actDep") or st_row.get("etd") or st_row.get("ActualDeparture")
+                or st_row.get("schDep") or st_row.get("DepartureTime") or st_row.get("departure"),
+                ref_dt,
+            )
+            if arr is None and dep is None:
+                continue
+            if arr is None:
+                arr = dep
+            if dep is None:
+                dep = arr
+            while arr < prev_ts:
+                arr += 86400000
+            if dep < arr:
+                dep = arr
+            prev_ts = dep
+            stops.append({
+                "code": code,
+                "name": str(st_row.get("stnName") or st_row.get("StationName") or st_row.get("stationName") or code),
+                "arr": arr,
+                "dep": dep,
+                "halt": True,
+            })
+        return stops
+
+    async def _probe_ctkt_train(tno: str, tname: str) -> Optional[Dict[str, Any]]:
+        async with sem:
+            for doj, ref_dt in (
+                (today_str, now_ist),
+                (yest_str, now_ist - timedelta(days=1)),
+                (two_days_ago_str, now_ist - timedelta(days=2)),
+            ):
+                try:
+                    raw = await client.live_train_status(tno, doj)
+                    if not isinstance(raw, dict):
+                        continue
+                    data = raw.get("data") if isinstance(raw.get("data"), dict) else raw
+                    if data.get("trainDataFound") is False or (data.get("trainDataFound") is None and not data.get("curStn")):
+                        continue
+                    if len(found_samples) < 2:
+                        found_samples.append(f"{tno}({doj}):{str(data)[:260]}")
+                    if data.get("terminated"):
+                        continue
+                    stops = _extract_stops_from_ctkt(data, ref_dt)
+                    cur_stn = str(
+                        data.get("curStn") or data.get("CurrentStation")
+                        or data.get("currentStation") or data.get("LastStationCode") or ""
+                    ).strip().upper()
+                    if not stops:
+                        continue
+                    delay_min = _parse_delay_minutes(
+                        data.get("delay") or data.get("DelayMinutes") or data.get("Delay") or 0
+                    )
+                    is_departed = bool(data.get("departed"))
+                    loc_obj = {
+                        "stationCode": cur_stn,
+                        "status": "departed" if is_departed else "at-station",
+                        "distanceFromLastStationKm": 2.0 if is_departed else 0,
+                        "speedKmh": 60 if is_departed else 0,
+                    } if cur_stn else None
+                    return {
+                        "id": tno,
+                        "number": tno,
+                        "name": str(data.get("trainName") or data.get("TrainName") or tname),
+                        "status": str(data.get("status") or data.get("Status") or data.get("Message") or "running"),
+                        "delayMin": delay_min,
+                        "updatedAt": int(time.time() * 1000),
+                        "stops": stops,
+                        "loc": loc_obj,
+                        "source": "live",
+                    }
+                except Exception:
+                    continue
+        return None
+
+    results = await asyncio.gather(*[_probe_ctkt_train(tno, tname) for tno, tname in seen.items()])
+    trains: List[Dict[str, Any]] = [r for r in results if r is not None]
     if not trains:
-        sample_info = f"live_keys=[{live_sample_keys}]"
-        try:
-            first_tno = next(iter(seen))
-            sample_raw = await client.live_train_status(first_tno, today_str)
-            sample_info = f"sample({first_tno})={str(sample_raw)[:280]}"
-        except Exception as sexc:
-            sample_info = f"sample_err={sexc}"
-        return {"trains": trains, "board_count": len(seen), "errors": [sample_info]}
+        msg = found_samples[0] if found_samples else f"0 of {len(seen)} had trainDataFound=True"
+        return {"trains": [], "board_count": len(seen), "errors": [msg]}
     return {"trains": trains, "board_count": len(seen), "errors": errors}
 
 
