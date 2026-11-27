@@ -300,30 +300,46 @@ async def _fetch_confirmtkt_async() -> Dict[str, Any]:
     now_ist = datetime.now(IST)
     today_str = now_ist.strftime("%d-%m-%Y")
     yest_str = (now_ist - timedelta(days=1)).strftime("%d-%m-%Y")
-    pairs = [("WADI", "SUR"), ("SUR", "KWV"), ("KWV", "DD"), ("MRJ", "KWV"), ("KWV", "LUR"), ("KLBG", "SUR")]
+    pairs = [
+        ("WADI", "SUR"), ("SUR", "WADI"),
+        ("SUR", "KWV"), ("KWV", "SUR"),
+        ("KWV", "DD"), ("DD", "KWV"),
+        ("MRJ", "KWV"), ("KWV", "MRJ"),
+        ("KWV", "LUR"), ("LUR", "KWV"),
+        ("KLBG", "BIDR"), ("BIDR", "KLBG"),
+    ]
 
     seen: Dict[str, str] = {}
     errors: List[str] = []
     avail_sample_keys = ""
-    for src, dst in pairs:
-        try:
-            res = await client.available_trains(src, dst, today_str)
-            if isinstance(res, dict):
-                if not avail_sample_keys:
-                    avail_sample_keys = ",".join(list(res.keys())[:6])
-                candidates = (
-                    res.get("trains") or res.get("Trains")
-                    or res.get("trainBtwnStnsList") or res.get("data")
-                    or res.get("AvailableTrains") or []
-                )
-                if isinstance(candidates, dict):
-                    candidates = candidates.get("trains") or candidates.get("trainBtwnStnsList") or []
-                for t in (candidates if isinstance(candidates, list) else []):
-                    tno = str(t.get("trainNumber") or t.get("TrainNumber") or t.get("TrainNo") or t.get("number") or "").strip()
-                    if tno and tno not in seen:
-                        seen[tno] = str(t.get("trainName") or t.get("TrainName") or tno).strip()
-        except Exception as exc:
+    pair_sem = asyncio.Semaphore(6)
+
+    async def _fetch_pair(src: str, dst: str):
+        async with pair_sem:
+            try:
+                return src, dst, await client.available_trains(src, dst, today_str), None
+            except Exception as exc:
+                return src, dst, None, exc
+
+    pair_results = await asyncio.gather(*[_fetch_pair(s, d) for s, d in pairs])
+    for src, dst, res, exc in pair_results:
+        if exc is not None:
             errors.append(f"{src}-{dst}: {exc}")
+            continue
+        if isinstance(res, dict):
+            if not avail_sample_keys:
+                avail_sample_keys = ",".join(list(res.keys())[:6])
+            candidates = (
+                res.get("trains") or res.get("Trains")
+                or res.get("trainBtwnStnsList") or res.get("data")
+                or res.get("AvailableTrains") or []
+            )
+            if isinstance(candidates, dict):
+                candidates = candidates.get("trains") or candidates.get("trainBtwnStnsList") or []
+            for t in (candidates if isinstance(candidates, list) else []):
+                tno = str(t.get("trainNumber") or t.get("TrainNumber") or t.get("TrainNo") or t.get("number") or "").strip()
+                if tno and tno not in seen:
+                    seen[tno] = str(t.get("trainName") or t.get("TrainName") or tno).strip()
 
     if not seen:
         # Fallback seed list of major Solapur Division trains
@@ -418,11 +434,15 @@ async def _fetch_confirmtkt_async() -> Dict[str, Any]:
                         data.get("delay") or data.get("DelayMinutes") or data.get("Delay") or 0
                     )
                     is_departed = bool(data.get("departed"))
+                    in_stops = any(s["code"] == cur_stn for s in stops)
+                    next_stn = str(data.get("nextStn") or data.get("NextStationCode") or "").strip().upper()
+                    use_departed = is_departed and (in_stops or bool(next_stn))
                     loc_obj = {
                         "stationCode": cur_stn,
-                        "status": "departed" if is_departed else "at-station",
-                        "distanceFromLastStationKm": 2.0 if is_departed else 0,
-                        "speedKmh": 60 if is_departed else 0,
+                        "nextStationCode": next_stn or None,
+                        "status": "departed" if use_departed else "at-station",
+                        "distanceFromLastStationKm": 2.0 if use_departed else 0,
+                        "speedKmh": 60 if use_departed else 0,
                     } if cur_stn else None
                     return {
                         "id": tno,
