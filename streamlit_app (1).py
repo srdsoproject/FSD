@@ -323,14 +323,18 @@ async def _fetch_confirmtkt_async() -> Dict[str, Any]:
     seen: Dict[str, str] = {}
     errors: List[str] = []
     avail_sample_keys = ""
-    pair_sem = asyncio.Semaphore(14)
+    pair_sem = asyncio.Semaphore(5)
 
     async def _fetch_pair(src: str, dst: str, doj_str: str):
         async with pair_sem:
-            try:
-                return src, dst, await client.available_trains(src, dst, doj_str), None
-            except Exception as exc:
-                return src, dst, None, exc
+            for attempt in range(2):
+                try:
+                    return src, dst, await client.available_trains(src, dst, doj_str), None
+                except Exception as exc:
+                    if attempt == 0:
+                        await asyncio.sleep(0.5)
+                    else:
+                        return src, dst, None, exc
 
     # Query BOTH today and tomorrow so trains that already departed `src` earlier today are still discovered
     tasks = [_fetch_pair(s, d, today_str) for s, d in pairs] + [_fetch_pair(s, d, tomorrow_str) for s, d in pairs]
@@ -354,13 +358,25 @@ async def _fetch_confirmtkt_async() -> Dict[str, Any]:
                 if tno and tno not in seen:
                     seen[tno] = str(t.get("trainName") or t.get("TrainName") or tno).strip()
 
-    if not seen:
-        # Fallback seed list of major Solapur Division trains
-        for tno in ["12115", "12116", "11301", "11302", "11019", "11020", "12701", "12702", "16589", "16590", "12157", "12158", "11027", "11028", "17221", "17222"]:
+    # Always merge major Solapur Division trains (covers trains that skip junctions or lack reservation)
+    solapur_seed = [
+        "12115", "12116", "11301", "11302", "11019", "11020", "12701", "12702",
+        "16589", "16590", "12157", "12158", "11027", "11028", "17221", "17222",
+        "22225", "22226", "22159", "22160", "16339", "16340", "16351", "16352",
+        "16381", "16382", "11013", "11014", "11041", "11042", "11073", "11074",
+        "12163", "12164", "12219", "12220", "22157", "22158", "11403", "11404",
+        "11405", "11406", "11407", "11408", "11415", "11416", "11423", "11424",
+        "11425", "11426", "17031", "17032", "18519", "18520", "20919", "20920",
+        "16535", "16536", "07143", "07144", "17613", "17614", "17629", "17630",
+        "11411", "11412", "11427", "11428", "12755", "12756", "22687", "22688",
+    ]
+    for tno in solapur_seed:
+        if tno not in seen:
             seen[tno] = tno
 
-    sem = asyncio.Semaphore(10)
+    sem = asyncio.Semaphore(6)
     two_days_ago_str = (now_ist - timedelta(days=2)).strftime("%d-%m-%Y")
+    three_days_ago_str = (now_ist - timedelta(days=3)).strftime("%d-%m-%Y")
     found_samples: List[str] = []
 
     def _extract_stops_from_ctkt(data: Dict[str, Any], ref_dt: datetime) -> List[Dict[str, Any]]:
@@ -424,6 +440,7 @@ async def _fetch_confirmtkt_async() -> Dict[str, Any]:
                 (today_str, now_ist),
                 (yest_str, now_ist - timedelta(days=1)),
                 (two_days_ago_str, now_ist - timedelta(days=2)),
+                (three_days_ago_str, now_ist - timedelta(days=3)),
             ):
                 try:
                     raw = await client.live_train_status(tno, doj)
