@@ -1,26 +1,26 @@
 """
-All-in-One Solapur Division Live Railway Map + NTES Backend.
+Streamlit App — Solapur Division Interactive Railway Map with Live NTES Trains.
 
-Single file—run with ONE command:
-  pip install fastapi uvicorn ntes-client
-  python app.py
+Deploy for FREE on Streamlit Community Cloud (https://share.streamlit.io) to get
+a single shareable public URL with live NTES trains—no localhost or API key needed.
 
-Then open: http://localhost:8000
-To share publicly for free:
-  cloudflared tunnel --url http://localhost:8000
+Run locally:
+  pip install streamlit ntes-client
+  streamlit run streamlit_app.py
 """
 
+import json
+import os
 import re
 import time
-import asyncio
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import uvicorn
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+import streamlit as st
+import streamlit.components.v1 as components
 
 try:
     from ntes import NTESClient
@@ -29,18 +29,23 @@ except ImportError:
 
 IST = timezone(timedelta(hours=5, minutes=30))
 JUNCTIONS = ["WADI", "KLBG", "SUR", "KWV", "DD", "MRJ", "LUR"]
-CACHE_TTL_SEC = 180  # 3 minutes
 
-app = FastAPI(title="Solapur Division Live Railway Map")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["GET"],
-    allow_headers=["*"],
+st.set_page_config(
+    page_title="Solapur Division Live Railway Map",
+    layout="wide",
+    initial_sidebar_state="collapsed",
 )
 
-_cache: Dict[str, Any] = {"ts": 0.0, "trains": []}
-_lock = asyncio.Lock()
+# Hide default Streamlit padding/chrome so the map fills the screen
+st.markdown(
+    """
+    <style>
+      .block-container { padding: 0.4rem 0.6rem 0 0.6rem; max-width: 100%; }
+      header[data-testid="stHeader"] { height: 2.2rem; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
 def _parse_delay_minutes(val: Any) -> int:
@@ -110,12 +115,12 @@ def _normalize_from_live_status(train_no: str, fallback_name: str, live: Dict[st
 
     stops: List[Dict[str, Any]] = []
     prev_ts = -1
-    for st in stns:
-        code = str(st.get("SC") or "").strip().upper()
+    for st_row in stns:
+        code = str(st_row.get("SC") or "").strip().upper()
         if not code:
             continue
-        arr = _parse_ntes_eta_etd_ms(st.get("ETA") or st.get("STA"), ref_year)
-        dep = _parse_ntes_eta_etd_ms(st.get("ETD") or st.get("STD"), ref_year)
+        arr = _parse_ntes_eta_etd_ms(st_row.get("ETA") or st_row.get("STA"), ref_year)
+        dep = _parse_ntes_eta_etd_ms(st_row.get("ETD") or st_row.get("STD"), ref_year)
         if arr is None and dep is None:
             continue
         if arr is None:
@@ -129,7 +134,7 @@ def _normalize_from_live_status(train_no: str, fallback_name: str, live: Dict[st
         prev_ts = dep
         stops.append({
             "code": code,
-            "name": str(st.get("SN") or code).strip(),
+            "name": str(st_row.get("SN") or code).strip(),
             "arr": arr,
             "dep": dep,
             "halt": True,
@@ -183,9 +188,10 @@ def _normalize_from_live_status(train_no: str, fallback_name: str, live: Dict[st
     }
 
 
-def _fetch_board(stn: str) -> List[tuple]:
+def _fetch_board(stn: str) -> tuple:
     client = NTESClient(timeout=10, retries=2)
     out = []
+    err = None
     try:
         board = client.station_live(stn, hours=4) or {}
         entries = board.get("TrainsAtStation") or board.get("trains") or []
@@ -194,8 +200,8 @@ def _fetch_board(stn: str) -> List[tuple]:
             if tno:
                 out.append((tno, str(item.get("TrainName") or item.get("trainName") or tno).strip()))
     except Exception as exc:
-        print(f"[NTES station_live error] {stn}: {exc}")
-    return out
+        err = f"{stn}: {exc}"
+    return out, err
 
 
 def _fetch_one_train(tno: str, name: str) -> Optional[Dict[str, Any]]:
@@ -204,64 +210,86 @@ def _fetch_one_train(tno: str, name: str) -> Optional[Dict[str, Any]]:
         start_date = _pick_active_start_date(client, tno)
         live = client.live_status(tno, start_date) or {}
         return _normalize_from_live_status(tno, name, live)
-    except Exception as exc:
-        print(f"[NTES live_status error] {tno}: {exc}")
+    except Exception:
         return None
 
 
-def _fetch_all_junction_trains_sync() -> List[Dict[str, Any]]:
-    if NTESClient is None:
-        raise RuntimeError("ntes-client is not installed. Run: pip install ntes-client")
+DEFAULT_FEED_URL = "https://hollow-secretary-partner-trinity.trycloudflare.com/api/live-network"
 
+
+def _get_remote_feed_url() -> str:
+    try:
+        if "LIVE_NETWORK_URL" in st.secrets:
+            val = str(st.secrets["LIVE_NETWORK_URL"]).strip()
+            if val:
+                return val
+    except Exception:
+        pass
+    return os.environ.get("LIVE_NETWORK_URL", "").strip() or DEFAULT_FEED_URL
+
+
+@st.cache_data(ttl=180, show_spinner="Fetching live NTES trains across Solapur Division...")
+def fetch_live_network_trains() -> Dict[str, Any]:
+    remote_url = _get_remote_feed_url()
+    if remote_url:
+        try:
+            req = urllib.request.Request(remote_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            trains = data if isinstance(data, list) else (data.get("trains") or [])
+            return {"trains": trains, "board_count": len(trains), "errors": []}
+        except Exception as exc:
+            return {"trains": [], "board_count": 0, "errors": [f"Feed URL error: {exc}"]}
+
+    if NTESClient is None:
+        return {"trains": [], "board_count": 0, "errors": ["ntes-client not installed"]}
     seen: Dict[str, str] = {}
+    errors: List[str] = []
     with ThreadPoolExecutor(max_workers=3) as pool:
-        for rows in pool.map(_fetch_board, JUNCTIONS):
+        for rows, err in pool.map(_fetch_board, JUNCTIONS):
+            if err:
+                errors.append(err)
             for tno, name in rows:
                 if tno not in seen:
                     seen[tno] = name
 
     if not seen:
-        return []
+        return {"trains": [], "board_count": 0, "errors": errors}
 
     trains: List[Dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    with ThreadPoolExecutor(max_workers=3) as pool:
         futures = [pool.submit(_fetch_one_train, tno, name) for tno, name in seen.items()]
         for fut in as_completed(futures):
             res = fut.result()
             if res:
                 trains.append(res)
-    return trains
+    return {"trains": trains, "board_count": len(seen), "errors": errors}
 
 
-@app.get("/", response_class=HTMLResponse)
-async def index():
-    return HTMLResponse(content=MAP_HTML)
+col1, col2 = st.columns([5, 1])
+with col2:
+    if st.button("Refresh Live Trains", use_container_width=True):
+        fetch_live_network_trains.clear()
 
+if NTESClient is None:
+    st.error("`ntes-client` is not installed in this Python environment. Run: `pip install ntes-client`")
 
-@app.get("/health")
-async def health():
-    return {
-        "ok": True,
-        "ntesLoaded": NTESClient is not None,
-        "cachedTrains": len(_cache["trains"]),
-        "cacheAgeSec": round(time.time() - _cache["ts"], 1),
-    }
+res_data = fetch_live_network_trains()
+trains = res_data["trains"]
+with col1:
+    err_note = f" · Errors: {'; '.join(res_data['errors'][:2])}" if res_data["errors"] else ""
+    st.caption(
+        f"Live NTES Feed · {len(trains)}/{res_data['board_count']} trains loaded across {', '.join(JUNCTIONS)} · "
+        f"Updated {datetime.now(IST).strftime('%H:%M:%S IST')}{err_note}"
+    )
 
-
-@app.get("/api/live-network")
-async def live_network():
-    now = time.time()
-    if now - _cache["ts"] < CACHE_TTL_SEC and _cache["trains"]:
-        return {"trains": _cache["trains"], "cached": True, "updatedAt": int(_cache["ts"] * 1000)}
-
-    async with _lock:
-        if time.time() - _cache["ts"] < CACHE_TTL_SEC and _cache["trains"]:
-            return {"trains": _cache["trains"], "cached": True, "updatedAt": int(_cache["ts"] * 1000)}
-        trains = await asyncio.to_thread(_fetch_all_junction_trains_sync)
-        _cache["ts"] = time.time()
-        _cache["trains"] = trains
-        return {"trains": trains, "cached": False, "updatedAt": int(_cache["ts"] * 1000)}
-
+inject_script = f"""
+<script>
+  window.__PRELOADED_LIVE_TRAINS__ = {json.dumps(trains)};
+</script>
+</head>
+"""
+components.html(MAP_HTML.replace("</head>", inject_script, 1), height=820, scrolling=False)
 
 MAP_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -3596,7 +3624,7 @@ MAP_HTML = """<!DOCTYPE html>
       const LT_STORE = "railLiveTrainsCfg_v2";
       const ltCfg = {
         provider: "network",
-        networkUrl: "/api/live-network",
+        networkUrl: "http://localhost:8000/api/live-network",
         baseUrl: "https://api.railradar.in",
         apiKey: "",
         authStyle: "header",
@@ -3605,7 +3633,7 @@ MAP_HTML = """<!DOCTYPE html>
         usage: { m: "", n: 0 }
       };
       try { const raw = localStorage.getItem(LT_STORE); if (raw) Object.assign(ltCfg, JSON.parse(raw)); } catch (e) {}
-      if (location.protocol.startsWith("http")) { ltCfg.provider = "network"; ltCfg.networkUrl = "/api/live-network"; }
+      if (Array.isArray(window.__PRELOADED_LIVE_TRAINS__)) { ltCfg.provider = "network"; }
       function ltSave() { try { localStorage.setItem(LT_STORE, JSON.stringify(ltCfg)); } catch (e) {} }
 
       // <LT-PURE>
@@ -4216,7 +4244,3 @@ MAP_HTML = """<!DOCTYPE html>
 </body>
 </html>
 """
-
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
