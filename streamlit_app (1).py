@@ -275,6 +275,8 @@ def fetch_live_network_trains() -> Dict[str, Any]:
             res = fut.result()
             if res:
                 trains.append(res)
+    if not trains:
+        errors.insert(0, f"keys(avail=[{avail_sample_keys}], live=[{live_sample_keys}])")
     return {"trains": trains, "board_count": len(seen), "errors": errors}
 
 
@@ -304,22 +306,40 @@ async def _fetch_confirmtkt_async() -> Dict[str, Any]:
 
     seen: Dict[str, str] = {}
     errors: List[str] = []
+    avail_sample_keys = ""
     for src, dst in pairs:
         try:
             res = await client.available_trains(src, dst, today_str)
             if isinstance(res, dict):
-                for t in (res.get("trains") or res.get("Trains") or []):
-                    tno = str(t.get("trainNumber") or t.get("TrainNumber") or t.get("number") or "").strip()
+                if not avail_sample_keys:
+                    avail_sample_keys = ",".join(list(res.keys())[:6])
+                candidates = (
+                    res.get("trains") or res.get("Trains")
+                    or res.get("trainBtwnStnsList") or res.get("data")
+                    or res.get("AvailableTrains") or []
+                )
+                if isinstance(candidates, dict):
+                    candidates = candidates.get("trains") or candidates.get("trainBtwnStnsList") or []
+                for t in (candidates if isinstance(candidates, list) else []):
+                    tno = str(t.get("trainNumber") or t.get("TrainNumber") or t.get("TrainNo") or t.get("number") or "").strip()
                     if tno and tno not in seen:
                         seen[tno] = str(t.get("trainName") or t.get("TrainName") or tno).strip()
         except Exception as exc:
             errors.append(f"{src}-{dst}: {exc}")
 
+    if not seen:
+        # Fallback seed list of major Solapur Division trains
+        for tno in ["12115", "12116", "11301", "11302", "11019", "11020", "12701", "12702", "16589", "16590", "12157", "12158", "11027", "11028", "17221", "17222"]:
+            seen[tno] = tno
+
     trains: List[Dict[str, Any]] = []
+    live_sample_keys = ""
     for tno, tname in list(seen.items())[:25]:
         for doj in (today_str, yest_str):
             try:
                 raw = await client.live_train_status(tno, doj)
+                if isinstance(raw, dict) and not live_sample_keys:
+                    live_sample_keys = ",".join(list(raw.keys())[:8])
                 if not isinstance(raw, dict):
                     continue
                 data = raw.get("data") if isinstance(raw.get("data"), dict) else raw
